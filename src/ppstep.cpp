@@ -42,7 +42,13 @@ static std::string read_entire_file(std::istream&& instream) {
 }
 
 bool parse_args(int argc, char const** argv, po::variables_map& vm) {
-    po::options_description desc("ppstep");
+    po::options_description desc("ppstep — C preprocessor macro-expansion debugger\n\n"
+                                  "Usage: ppstep [options] <input-file>\n\n"
+                                  "Examples:\n"
+                                  "  ppstep test.c                Step through preprocessing of test.c\n"
+                                  "  ppstep -DFOO=42 test.c       Predefine FOO, then step through\n"
+                                  "  ppstep -I./inc test.c        Add ./inc to include path\n\n"
+                                  "Options");
     desc.add_options()
         ("help,h", "produce help message")
         ("include,I", po::value<std::vector<std::string>>()->composing(),
@@ -60,8 +66,8 @@ bool parse_args(int argc, char const** argv, po::variables_map& vm) {
     po::store(po::command_line_parser(argc, argv).options(desc).positional(p).run(), vm);
 
     if (vm.count("help")) {
-        std::cerr << desc << std::endl;
-        return false;
+        std::cout << desc << std::endl;
+        return true;
     }
 
     try {
@@ -78,6 +84,9 @@ int main(int argc, char const** argv) {
     po::variables_map args;
     if (!parse_args(argc, argv, args))
         return 1;
+
+    if (args.count("help"))
+        return 0;
 
     char const* input_file = args["input-file"].as<std::string>().c_str();
     auto instring = read_entire_file(std::ifstream(input_file));
@@ -117,6 +126,8 @@ int main(int argc, char const** argv) {
             ctx.remove_macro_definition(definition, true);
         }
     }
+
+    ppstep::linenoise_init();
 
     auto first = ctx.begin();
     auto last = ctx.end();

@@ -281,7 +281,6 @@ namespace ppstep {
         
         template <typename ContextT, typename ExceptionT>
         void on_exception(ContextT& ctx, ExceptionT const& e) {
-            std::cout << e.what() << ": " << e.description() << std::endl;
             cli.prompt(ctx, "exception");
         }
 
@@ -299,13 +298,26 @@ namespace ppstep {
         void add_breakpoint(typename TokenT::string_type const& macro, preprocessing_event_type cond) {
             switch (cond) {
                 case preprocessing_event_type::CALL: {
-                    expansion_breakpoints.insert(macro);
+                    if (expansion_breakpoints.insert(macro).second)
+                        numbered_breakpoints.push_back({next_bp_id++, macro, cond});
                     break;
                 }
                 case preprocessing_event_type::EXPANDED: {
-                    expanded_breakpoints.insert(macro);
+                    if (expanded_breakpoints.insert(macro).second)
+                        numbered_breakpoints.push_back({next_bp_id++, macro, cond});
                     break;
                 }
+                case preprocessing_event_type::RESCANNED: {
+                    if (rescanned_breakpoints.insert(macro).second)
+                        numbered_breakpoints.push_back({next_bp_id++, macro, cond});
+                    break;
+                }
+                case preprocessing_event_type::LEXED: {
+                    if (lexed_breakpoints.insert(macro).second)
+                        numbered_breakpoints.push_back({next_bp_id++, macro, cond});
+                    break;
+                }
+                default: break;
             }
         }
 
@@ -319,6 +331,55 @@ namespace ppstep {
                     expanded_breakpoints.erase(macro);
                     break;
                 }
+                case preprocessing_event_type::RESCANNED: {
+                    rescanned_breakpoints.erase(macro);
+                    break;
+                }
+                case preprocessing_event_type::LEXED: {
+                    lexed_breakpoints.erase(macro);
+                    break;
+                }
+                default: break;
+            }
+            numbered_breakpoints.erase(
+                std::remove_if(numbered_breakpoints.begin(), numbered_breakpoints.end(),
+                    [&macro, cond](auto const& bp) { return bp.name == macro && bp.type == cond; }),
+                numbered_breakpoints.end());
+        }
+
+        bool remove_breakpoint(int id) {
+            auto it = std::find_if(numbered_breakpoints.begin(), numbered_breakpoints.end(),
+                [id](auto const& bp) { return bp.id == id; });
+            if (it == numbered_breakpoints.end()) return false;
+
+            switch (it->type) {
+                case preprocessing_event_type::CALL: expansion_breakpoints.erase(it->name); break;
+                case preprocessing_event_type::EXPANDED: expanded_breakpoints.erase(it->name); break;
+                case preprocessing_event_type::RESCANNED: rescanned_breakpoints.erase(it->name); break;
+                case preprocessing_event_type::LEXED: lexed_breakpoints.erase(it->name); break;
+                default: break;
+            }
+            numbered_breakpoints.erase(it);
+            return true;
+        }
+
+        struct numbered_bp {
+            int id;
+            typename TokenT::string_type name;
+            preprocessing_event_type type;
+        };
+
+        std::vector<numbered_bp> const& list_breakpoints() const {
+            return numbered_breakpoints;
+        }
+
+        char const* bp_type_name(preprocessing_event_type t) const {
+            switch (t) {
+                case preprocessing_event_type::CALL: return "call";
+                case preprocessing_event_type::EXPANDED: return "expand";
+                case preprocessing_event_type::RESCANNED: return "rescan";
+                case preprocessing_event_type::LEXED: return "lex";
+                default: return "?";
             }
         }
         
@@ -434,17 +495,26 @@ namespace ppstep {
                 case stepping_mode::UNTIL_BREAK: {
                     switch (type) {
                         case preprocessing_event_type::CALL: {
-                            if (expansion_breakpoints.find(token.get_value()) != expansion_breakpoints.end()) {
+                            if (expansion_breakpoints.find(token.get_value()) != expansion_breakpoints.end())
                                 do_prompt = true;
-                            }
                             break;
                         }
                         case preprocessing_event_type::EXPANDED: {
-                            if (expanded_breakpoints.find(token.get_value()) != expanded_breakpoints.end()) {
+                            if (expanded_breakpoints.find(token.get_value()) != expanded_breakpoints.end())
                                 do_prompt = true;
-                            }
                             break;
                         }
+                        case preprocessing_event_type::RESCANNED: {
+                            if (rescanned_breakpoints.find(token.get_value()) != rescanned_breakpoints.end())
+                                do_prompt = true;
+                            break;
+                        }
+                        case preprocessing_event_type::LEXED: {
+                            if (lexed_breakpoints.find(token.get_value()) != lexed_breakpoints.end())
+                                do_prompt = true;
+                            break;
+                        }
+                        default: break;
                     }
                     break;
                 }
@@ -459,6 +529,10 @@ namespace ppstep {
         client_cli<TokenT, ContainerT> cli;
         std::set<typename TokenT::string_type> expansion_breakpoints;
         std::set<typename TokenT::string_type> expanded_breakpoints;
+        std::set<typename TokenT::string_type> rescanned_breakpoints;
+        std::set<typename TokenT::string_type> lexed_breakpoints;
+        std::vector<numbered_bp> numbered_breakpoints;
+        int next_bp_id = 1;
         stepping_mode mode;
 
         std::list<offset_container<ContainerT>> token_stack;
