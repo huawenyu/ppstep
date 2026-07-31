@@ -1,4 +1,5 @@
 # ppstep
+
 The C and C++ preprocessors are famous for allowing users to write opaque, hard-to-follow code through macros. These downsides are tolerated because macros also allow code to have a high level of abstraction, which can reduce software complexity and improve developer productivity. Doing the good parts takes dicipline; eliminating the bad parts takes refactoring, and importantly, debugging. PPstep is the debugger that macro writers can use to do that.
 
 <p align="center">
