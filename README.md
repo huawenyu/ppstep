@@ -26,6 +26,9 @@ sudo apt install cmake
 git clone https://github.com/huawenyu/ppstep.git
 cd ppstep
 mkdir build && cd build && cmake .. && make
+
+OR: change cmake .. to:
+   cmake -DCMAKE_C_COMPILER=/usr/bin/gcc -DCMAKE_CXX_COMPILER=/usr/bin/g++ ..
 ```
 
 ## Usage

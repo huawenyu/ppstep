@@ -284,11 +284,22 @@ namespace ppstep {
             prompt += "> ";
 
             for (char* raw_line; (raw_line = linenoise(prompt.c_str())) != nullptr;) {
-                linenoiseHistoryAdd(raw_line);
+                bool empty = (raw_line[0] == '\0');
+                if (empty && last_command.empty()) {
+                    std::free(static_cast<void*>(raw_line));
+                    continue;
+                }
 
-                bool valid = parse(ctx, raw_line, raw_line + std::strlen(raw_line));
+                char const* cmd = empty ? last_command.c_str() : raw_line;
+                if (!empty) {
+                    linenoiseHistoryAdd(raw_line);
+                }
+
+                bool valid = parse(ctx, cmd, cmd + std::strlen(cmd));
                 if (!valid) {
-                    std::cout << "Undefined command: \"" << raw_line << "\"." << std::endl;
+                    std::cout << "Undefined command: \"" << cmd << "\"." << std::endl;
+                } else {
+                    last_command = cmd;
                 }
 
                 std::free(static_cast<void*>(raw_line));
@@ -303,6 +314,7 @@ namespace ppstep {
         client<TokenT, ContainerT>& cl;
         std::size_t steps_requested;
         std::string prefix;
+        std::string last_command;
     };
 }
 
