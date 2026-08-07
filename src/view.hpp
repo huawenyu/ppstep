@@ -576,6 +576,10 @@ namespace ppstep {
                 if (cl.is_verbose()) event.print_verbose(std::cout, latest->tokens, ctx);
                 else                  event.print(std::cout, latest->tokens);
             }, latest->event);
+
+            // Always mirror the current frames state to the log file so
+            // the user can `tail -f` it in another terminal.
+            cl.write_frames_log(ctx);
         }
 
         template <class ContextT>
@@ -740,23 +744,6 @@ namespace ppstep {
             };
 
             if (print_state) current_state(ctx);
-
-            // Print a banner ABOVE the prompt line — used to surface the
-            // `#define` of the macro being entered, so the user can see
-            // what the call is about to substitute without leaving the prompt.
-            if (!trigger.empty() && trigger.compare(0, 8, "calling ") == 0) {
-                std::string name = trigger.substr(8);  // strip "calling " prefix
-                // Macro names don't contain spaces; trim any trailing junk
-                // (e.g. if the trigger had extra characters appended).
-                auto sp = name.find(' ');
-                if (sp != std::string::npos) name = name.substr(0, sp);
-                std::cout << cl.make_calling_banner(name, ctx);
-            } else if (!trigger.empty() && trigger.compare(0, 10, "rescanned ") == 0) {
-                std::string name = trigger.substr(10);
-                auto sp = name.find(' ');
-                if (sp != std::string::npos) name = name.substr(0, sp);
-                std::cout << cl.make_rescanned_banner(name);
-            }
 
             auto prompt = std::string("pp");
             if (!prefix.empty()) {

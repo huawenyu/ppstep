@@ -8,10 +8,13 @@
 #include <tuple>
 #include <iostream>
 #include <sstream>
+#include <fstream>
 #include <stdexcept>
 #include <algorithm>
 #include <set>
 #include <functional>
+#include <ctime>
+#include <unistd.h>
 
 #include "server_fwd.hpp"
 #include "client_fwd.hpp"
@@ -813,6 +816,199 @@ namespace ppstep {
             return os.str();
         }
 
+        // Right-pane content: rescan queue + call stack, returned as
+        // a vector of lines so the caller can render it side-by-side
+        // with the main event output.
+        std::vector<std::string> frames_pane_lines() const {
+            std::vector<std::string> lines;
+
+            // ─── rescan queue ───
+            lines.push_back("-- rescan queue --");
+            std::size_t qdepth_pre = state->rescanning.size();
+            std::size_t qdepth = qdepth_pre == 0 ? 0 : qdepth_pre - 1;
+            if (qdepth == 0) {
+                lines.push_back("  empty (lex/punct next)");
+            } else {
+                lines.push_back(std::string("  ") + std::to_string(qdepth)
+                    + " frame" + (qdepth == 1 ? "" : "s") + " (next first):");
+                int qidx = 0;
+                auto it = state->rescanning.rbegin();
+                ++it;
+                for (; qidx < (int)qdepth; ++qidx, ++it) {
+                    auto const& cause = it->first;
+                    std::string qname = cause.empty() ? "(unknown)"
+                                                      : std::string(cause.begin()->get_value().c_str());
+                    std::string line = "    #" + std::to_string(qidx) + " " + qname;
+                    // ASCII marker "<-" instead of ◀ so byte-pad in
+                    // write_frames_log stays aligned with char columns.
+                    if (qidx == 0) line += "  <- next";
+                    lines.push_back(line);
+                }
+            }
+
+            lines.push_back("");
+
+            // ─── call stack ───
+            lines.push_back("-- call stack --");
+            std::size_t edepth = state->expanding.size();
+            if (edepth == 0) {
+                lines.push_back("  (empty)");
+            } else {
+                lines.push_back(std::string("  ") + std::to_string(edepth)
+                    + " frame" + (edepth == 1 ? "" : "s") + " (innermost first):");
+                int eidx = 0;
+                for (auto it = state->expanding.rbegin(); it != state->expanding.rend(); ++it, ++eidx) {
+                    if (it->empty()) continue;
+                    std::string ename(it->begin()->get_value().c_str());
+                    std::string line = "    #" + std::to_string(eidx) + " " + ename;
+                    // ASCII marker "<-" instead of ◀ for column alignment.
+                    if (eidx == 0) line += "  <- current";
+                    lines.push_back(line);
+                }
+            }
+            return lines;
+        }
+
+        // Path of the frames log file. Fixed at /tmp/ppstep_frames.log so
+        // the user has a stable known location to `tail -f` from another
+        // terminal. Appended-to on every event stop (file only grows),
+        // so `tail -f` works without "file truncated" warnings.
+        static std::string default_frames_log_path() {
+            return "/tmp/ppstep_frames.log";
+        }
+
+        // Append a two-pane snapshot of the current preprocessing state to
+        // the log file. Left pane: rescan queue + call stack. Right pane:
+        // `#define` of the next macro wave will rescan, plus `#define` of
+        // the macro wave is currently expanding. Appended to (never
+        // truncated) so `tail -f` runs cleanly without "file truncated"
+        // warnings or content overlap.
+        template <class ContextT>
+        void write_frames_log(ContextT& ctx) const {
+            if (!frames_log_open) {
+                std::string path = frames_log_path.empty() ? default_frames_log_path()
+                                                           : frames_log_path;
+                frames_log_file.open(path, std::ios::out | std::ios::app);
+                frames_log_open = true;
+            }
+            if (!frames_log_file) return;
+
+            char ts[32];
+            std::time_t t = std::time(nullptr);
+            std::tm tm_buf{};
+            localtime_r(&t, &tm_buf);
+            std::strftime(ts, sizeof(ts), "%H:%M:%S", &tm_buf);
+
+            // -- LEFT pane: rescan queue + call stack counts/lists ---------
+            std::vector<std::string> left_lines = frames_pane_lines();
+
+            // -- RIGHT pane: #define for two key macros ------------------
+            std::vector<std::string> right_lines;
+            auto append_macro_def = [&](std::string const& header, std::string const& name) {
+                // Header includes the macro name so the user knows WHICH
+                // #define they're looking at without cross-referencing the
+                // left pane.
+                right_lines.push_back("-- " + header + ": " + name + " --");
+                bool has_params = false, is_predefined = false;
+                typename ContextT::position_type pos;
+                std::vector<typename ContextT::token_type> parameters;
+                typename ContextT::token_sequence_type definition;
+                try {
+                    ctx.get_macro_definition(name, has_params, is_predefined, pos, parameters, definition);
+                } catch (...) {
+                    right_lines.push_back("  (lookup failed)");
+                    return;
+                }
+                std::ostringstream bl;
+                bl << "  body: ";
+                for (auto const& t : definition) bl << t.get_value().c_str();
+                std::string body = bl.str();
+                constexpr std::size_t max_body = 60;
+                if (body.size() > max_body) body = body.substr(0, max_body - 3) + "...";
+                right_lines.push_back(body);
+                if (has_params) {
+                    std::ostringstream pl;
+                    pl << "  params: ";
+                    for (std::size_t i = 0; i < parameters.size(); ++i) {
+                        if (i) pl << ", ";
+                        pl << parameters[i].get_value().c_str();
+                    }
+                    right_lines.push_back(pl.str());
+                }
+            };
+
+            // The left pane already marks the next-to-rescan frame with
+            // `<- next`. So the right pane pairs with "now": just the
+            // currently-active expansion (innermost call frame).
+            if (!state->expanding.empty()) {
+                auto const& top = state->expanding.back();
+                if (!top.empty()) {
+                    std::string name(top.begin()->get_value().c_str());
+                    if (!name.empty()) {
+                        append_macro_def("current call", name);
+                    }
+                }
+            }
+
+            // -- Diff against previous frame snapshot ---------------------
+            // Set-based: classify each current line as new (in curr but not
+            // prev) or unchanged. Then append removed lines (in prev but not
+            // curr) so the user sees the frame that just popped. Set-based
+            // avoids false positives from section growth shifting later
+            // lines' positions.
+            struct diff_entry { std::string text; int kind; };
+            std::vector<diff_entry> left_diff;
+            std::set<std::string> prev_set(prev_frames_lines.begin(),
+                                           prev_frames_lines.end());
+            std::set<std::string> curr_set(left_lines.begin(),
+                                           left_lines.end());
+            for (auto const& line : left_lines) {
+                int kind = prev_set.count(line) ? 0 : +1;  // +1 = added
+                left_diff.push_back({line, kind});
+            }
+            for (auto const& line : prev_frames_lines) {
+                if (!curr_set.count(line)) {
+                    left_diff.push_back({line, -1});      // -1 = removed
+                }
+            }
+            prev_frames_lines = left_lines;  // snapshot for next diff
+
+            // -- Render two-pane layout, line by line ----------------------
+            constexpr int SPLIT = 50;
+            bool color = color_enabled();
+            std::size_t n = std::max(left_diff.size(), right_lines.size());
+            frames_log_file << "── [stop " << ts << "] ──\n";
+            for (std::size_t i = 0; i < n; ++i) {
+                std::string l = i < left_diff.size() ? left_diff[i].text : std::string();
+                int kind = i < left_diff.size() ? left_diff[i].kind : 0;
+                std::string r = i < right_lines.size() ? right_lines[i] : std::string();
+                if (l.size() > (std::size_t)SPLIT) l = l.substr(0, SPLIT - 3) + "...";
+                else if (l.size() < (std::size_t)SPLIT) l.append(SPLIT - l.size(), ' ');
+
+                // Color wrap goes AROUND the padded cell so byte-padding
+                // still puts `|` at column 50. ANSI bytes don't take columns
+                // in a terminal — only the cell content does.
+                if (kind != 0 && color) {
+                    if (kind > 0) frames_log_file << "\e[32m";   // green = added
+                    else         frames_log_file << "\e[31m";   // red   = removed
+                    frames_log_file << l << "\e[0m";
+                } else {
+                    frames_log_file << l;
+                }
+                frames_log_file << " | " << r << "\n";
+            }
+            frames_log_file << "──────────────────\n";
+            frames_log_file.flush();
+        }
+
+        void set_frames_log_path(std::string const& path) {
+            frames_log_path = path;
+        }
+
+        std::string const& get_frames_log_path() const {
+            return frames_log_path;
+        }
+
         // Banner printed ABOVE the prompt line for `calling` events. Shows the
         // macro's `#define` so the user sees what X is about to substitute
         // into, without polluting the `pp (...)` line itself.
@@ -920,6 +1116,12 @@ namespace ppstep {
         std::set<typename TokenT::string_type> lexed_breakpoints;
         bool finish_pending = false;
         std::size_t finish_target_depth = 0;
+        std::string frames_log_path;  // empty → use default_frames_log_path()
+        mutable std::ofstream frames_log_file;
+        mutable bool frames_log_open = false;
+        // Last left-pane snapshot, for diff-highlighting changed lines on the
+        // next write. Stays in sync with the most-recently-written block.
+        mutable std::vector<std::string> prev_frames_lines;
         std::vector<numbered_bp> numbered_breakpoints;
         int next_bp_id = 1;
         stepping_mode mode;

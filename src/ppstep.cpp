@@ -134,6 +134,10 @@ int main(int argc, char const** argv) {
     // Auto-enable color when stdout is a TTY; user can override via `set color`.
     ppstep::set_color_enabled(isatty(STDOUT_FILENO) != 0);
 
+    std::cerr << "frames log: " << ppstep::client<token_type,
+                                                 token_sequence_type>::default_frames_log_path()
+              << "  (tail -f in another terminal to watch rescan queue / call stack)\n";
+
     auto first = ctx.begin();
     auto last = ctx.end();
     try {
