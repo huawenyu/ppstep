@@ -59,15 +59,17 @@ namespace ppstep {
                 full_call.push_back(*seqend);
                 full_call = sanitize(full_call);
             }
-            
+
+            // Push BEFORE invoking the sink so that the REPL prompt fired at
+            // the `call` event reflects the new stack depth (used by `finish`).
+            state->expanding.push_back(full_call);
+
             if (!debug) {
                 sink->on_expand_function(ctx, macrodef, sanitized_arguments, full_call);
             } else {
                 std::cout << "F: ";
                 print_token_container(std::cout, full_call) << std::endl;
             }
-
-            state->expanding.push_back(full_call);
 
             return false;
         }
@@ -77,7 +79,9 @@ namespace ppstep {
                 ContextT& ctx, TokenT const& macrodef,
                 ContainerT const& definition, TokenT const& macrocall) {
             if (evaluating_conditional) return false;
-            
+
+            state->expanding.push_back({macrocall});
+
             if (!debug) {
                 sink->on_expand_object(ctx, macrocall);
             } else {
@@ -85,7 +89,6 @@ namespace ppstep {
                 print_token(std::cout, macrocall) << std::endl;
             }
 
-            state->expanding.push_back({macrocall});
             return false;
         }
 

@@ -12,6 +12,7 @@
 #include <map>
 #include <cstring>
 #include <functional>
+#include <unistd.h>
 
 #include <boost/wave/grammars/cpp_grammar_gen.hpp>
 
@@ -71,8 +72,8 @@ inline void linenoise_init() {
 
         if (context.empty() || tokens.empty() || (!trailing_space && tokens.size() == 1)) {
             // First word: command names
-            add_matching({"step", "continue", "backtrace", "forwardtrace", "break", "delete",
-                          "expand", "info", "what", "macros", "list", "help", "quit", "exit", "#define", "#undef", "#include"});
+            add_matching({"step", "continue", "finish", "backtrace", "forwardtrace", "break", "delete",
+                          "expand", "info", "what", "macros", "list", "set", "help", "quit", "exit", "#define", "#undef", "#include"});
         } else if (context == "b" || context == "break" ||
                    context == "d" || context == "delete") {
             if (n_real_tokens == 1) {
@@ -93,7 +94,13 @@ inline void linenoise_init() {
                         linenoiseAddCompletion(lc, name.c_str());
             }
         } else if (context == "i" || context == "info") {
-            add_matching({"breakpoints", "macros", "events"});
+            add_matching({"breakpoints", "macros", "args", "events"});
+        } else if (context == "set" || context == "s") {
+            // Only treat `set` as first word — drop the noisy `s` from completion
+            // since `s` is already `step`. Just complete subcommands.
+            if (context == "set" && n_real_tokens == 1) {
+                add_matching({"color", "verbose"});
+            }
         }
     });
 }
@@ -157,16 +164,16 @@ namespace ppstep {
             using position_type = typename ContextT::position_type;
             using token_sequence_type = typename ContextT::token_sequence_type;
             using lex_iterator_type = typename ContextT::lexer_type;
-            
+
             auto macro = std::string(attr.begin(), attr.end());
-            
+
             auto begin = lex_iterator_type(macro.begin(), macro.end(), position_type("<command line>"), ctx.get_language());
             auto end = lex_iterator_type();
-            
+
             token_sequence_type pending;
             token_sequence_type expanded;
             bool seen_newline;
-            
+
             auto old_hooks = std::move(ctx.get_hooks());
 
             auto new_state = server_state<ContainerT>();
@@ -281,6 +288,7 @@ namespace ppstep {
                 "\n"
                 "Stepping:\n"
                 "  step [N] / s [N]       Step forward N preprocessing events (default 1)\n"
+                "  finish / fin            Run until current macro expansion completes\n"
                 "  continue / c            Continue until breakpoint or end\n"
                 "\n"
                 "Breakpoints:\n"
@@ -290,6 +298,7 @@ namespace ppstep {
                 "  delete / d                         Remove all breakpoints\n"
                 "  info breakpoints / i b             List breakpoints\n"
                 "    types: call/c, expand/e, rescan/r, lex/l\n"
+                "  info args / i a                    Show arg → param bindings at current call\n"
                 "\n"
                 "Inspection:\n"
                 "  list / l                 Show source code around current position\n"
@@ -305,6 +314,13 @@ namespace ppstep {
                 "  #undef <name>            Undefine a macro mid-session\n"
                 "  #include <file>          Include a file mid-session\n"
                 "\n"
+                "Display:\n"
+                "  set color always|auto|never / s c al|au|ne\n"
+                "                            Color fg highlighting by token category\n"
+                "                              (ident / lit / str / kw / op)\n"
+                "  set verbose on|off / s v on|off\n"
+                "                            Verbose per-event panels (placeholder)\n"
+                "\n"
                 "Other:\n"
                 "  help                     Show this help\n"
                 "  quit / q                 Exit debugger\n"
@@ -316,6 +332,43 @@ namespace ppstep {
 
         void quit() {
             throw session_terminate();
+        }
+
+        void set_color_always() {
+            ppstep::set_color_enabled(true);
+            std::cout << "Color: always (fg highlighting by token category)\n" << std::flush;
+        }
+        void set_color_never() {
+            ppstep::set_color_enabled(false);
+            std::cout << "Color: never\n" << std::flush;
+        }
+        void set_color_auto() {
+            // TTY-detect at evaluation time
+            ppstep::set_color_enabled(isatty(STDOUT_FILENO) != 0);
+            std::cout << "Color: auto (now "
+                      << (ppstep::color_enabled() ? "on" : "off")
+                      << ")\n" << std::flush;
+        }
+        void set_verbose(bool on) {
+            cl.set_verbose(on);
+            std::cout << "Verbose mode: " << (on ? "on" : "off")
+                      << " — per-event panels (source context + macro definition)\n" << std::flush;
+        }
+
+        void finish() {
+            auto const& st = cl.get_state();
+            if (st.expanding.empty()) {
+                std::cout << "Not currently expanding a macro. "
+                             "Step until the call site is reached, then `finish`.\n" << std::flush;
+                return;
+            }
+            auto const& top = st.expanding.back();
+            std::cout << "Finishing expansion of: "
+                      << (top.empty() ? "<empty>" : std::string(top.begin()->get_value().c_str()))
+                      << "  (depth " << st.expanding.size() << ")\n" << std::flush;
+            cl.arm_finish();
+            cl.set_mode(stepping_mode::UNTIL_BREAK);
+            last_repeatable = true;
         }
 
         void list_breakpoints() {
@@ -347,6 +400,154 @@ namespace ppstep {
             }
             std::cout << std::flush;
         }
+
+        template <class ContextT>
+        void show_info_summary(ContextT& ctx) {
+            auto const& st = cl.get_state();
+
+            // ─── expanding context ───
+            std::cout << "═══ expanding context (depth " << st.expanding.size() << ") ═══\n";
+            if (st.expanding.empty()) {
+                std::cout << "  Not currently inside any macro expansion.\n";
+            } else {
+                auto print_frame = [&](char const* label, ContainerT const& frame) {
+                    if (frame.empty()) {
+                        std::cout << "  " << label << " : (empty frame)\n\n";
+                        return;
+                    }
+                    std::string name(frame.begin()->get_value().c_str());
+                    std::cout << "  " << label << " : " << name;
+
+                    bool has_params = false, is_predefined = false;
+                    typename ContextT::position_type pos;
+                    std::vector<typename ContextT::token_type> parameters;
+                    typename ContextT::token_sequence_type definition;
+                    try {
+                        ctx.get_macro_definition(name, has_params, is_predefined, pos, parameters, definition);
+                    } catch (...) {
+                        std::cout << "  (lookup failed)\n\n";
+                        return;
+                    }
+
+                    std::cout << "\n    #define " << name;
+                    if (has_params) {
+                        std::cout << '(';
+                        for (std::size_t i = 0; i < parameters.size(); ++i) {
+                            if (i) std::cout << ", ";
+                            std::cout << parameters[i].get_value().c_str();
+                        }
+                        std::cout << ')';
+                    }
+                    if (is_predefined) std::cout << "  (predefined)";
+                    std::cout << "\n    body   : ";
+                    for (auto const& t : definition) std::cout << t.get_value().c_str();
+                    std::cout << "\n\n";
+                };
+
+                print_frame("root     ", st.expanding.front());
+                if (st.expanding.size() > 1) {
+                    print_frame("expanding", st.expanding.back());
+                } else {
+                    std::cout << "  (single-frame — root and expanding are the same)\n\n";
+                }
+            }
+
+            // ─── pending rescans ───
+            std::cout << "── pending rescans (" << st.rescanning.size() << ") ──\n";
+            if (st.rescanning.empty()) {
+                std::cout << "  (none)\n";
+            } else {
+                std::size_t idx = 0;
+                for (auto const& frame : st.rescanning) {
+                    auto const& cause = frame.first;
+                    auto const& initial = frame.second;
+                    std::cout << "  " << idx++ << ": ";
+                    if (!cause.empty()) {
+                        std::cout << "cause=" << cause.begin()->get_value().c_str();
+                    } else {
+                        std::cout << "cause=?";
+                    }
+                    std::cout << "    over: ";
+                    print_token_container(std::cout, initial);
+                    std::cout << "\n";
+                }
+            }
+
+            // ─── recent events (last 5) ───
+            std::cout << "── recent events ──\n";
+            {
+                constexpr int N = 5;
+                int shown = 0;
+                auto it = cl.newest_history();
+                auto end = cl.oldest_history();
+                for (int i = 0; i < N && it != end; ++i, ++it) {
+                    ++shown;
+                    std::visit([&](auto const& e) {
+                        e.print_summary(std::cout);
+                    }, it->event);
+                }
+                if (shown == 0) std::cout << "  (none yet)\n";
+            }
+
+            // ─── counts (across token_history) ───
+            {
+                std::map<std::string, int> kind_counts;
+                std::map<std::string, int> macro_counts;
+                // Iterate newest → oldest (forward in reverse-iterator land;
+                // ++ on rend() would be UB).
+                for (auto h = cl.newest_history(); h != cl.oldest_history(); ++h) {
+                    std::visit([&](auto const& e) {
+                        kind_counts[e.event_kind()]++;
+                        if (auto n = e.event_macro_name()) {
+                            macro_counts[*n]++;
+                        }
+                    }, h->event);
+                }
+                std::cout << "── counts ──\n";
+                if (kind_counts.empty()) {
+                    std::cout << "  (no events yet)\n";
+                } else {
+                    std::cout << "  ";
+                    for (auto const& [k, v] : kind_counts) {
+                        std::cout << k << ":" << v << "  ";
+                    }
+                    std::cout << "\n";
+                    if (!macro_counts.empty()) {
+                        std::cout << "  per macro: ";
+                        bool first = true;
+                        for (auto const& [k, v] : macro_counts) {
+                            if (!first) std::cout << ", ";
+                            first = false;
+                            std::cout << k << " ×" << v;
+                        }
+                        std::cout << "\n";
+                    }
+                }
+            }
+
+            // ─── mode status ───
+            std::cout << "── mode ──\n";
+            std::cout << "  finish-pending: " << (cl.is_finish_armed() ? "yes" : "no") << "\n";
+            std::cout << "  verbose:        " << (cl.is_verbose() ? "on" : "off") << "\n";
+            std::cout << "  last cmd:       "
+                      << (last_command.empty() ? "(none yet)" : last_command)
+                      << "\n";
+            std::cout << "  breakpoints:    " << cl.list_breakpoints().size() << " active\n";
+
+            std::cout << std::flush;
+        }
+
+        template <class ContextT>
+        void show_args(ContextT& ctx) {
+            auto latest = cl.newest_history();
+            if (latest == cl.oldest_history()) {
+                std::cout << "No current event.\n" << std::flush;
+                return;
+            }
+            std::visit([&ctx](auto const& event) {
+                event.print_args(std::cout, ctx);
+            }, latest->event);
+        }
         
         void explain_current_state() {
             auto latest = cl.newest_history();
@@ -365,31 +566,42 @@ namespace ppstep {
             auto pos = ctx.get_main_pos();
             auto pos_file = boost::filesystem::path(pos.get_file().begin(), pos.get_file().end()).filename().string();
             std::cout << '[' << pos_file << ':' << pos.get_line() << ':'  << pos.get_column() << "]: ";
-            std::visit([&latest](auto const& event){ event.print(std::cout, latest->tokens); }, latest->event);
+
+            if (cl.is_verbose()) {
+                std::cout << '\n';
+                print_source_context(std::cout, ctx, 2);
+            }
+
+            std::visit([this, &ctx, &latest](auto const& event){
+                if (cl.is_verbose()) event.print_verbose(std::cout, latest->tokens, ctx);
+                else                  event.print(std::cout, latest->tokens);
+            }, latest->event);
         }
 
         template <class ContextT>
-        void list_source(ContextT& ctx, int context_lines = 5) {
+        static void print_source_context(std::ostream& os, ContextT& ctx, int context_lines) {
             auto pos = ctx.get_main_pos();
             auto file = std::string(pos.get_file().begin(), pos.get_file().end());
             if (file.empty() || file.rfind("<", 0) == 0) {
-                std::cout << "No source file for current position.\n" << std::flush;
+                os << "  (no source file for current position)\n";
                 return;
             }
 
-            // Cache file lines
             static std::map<std::string, std::vector<std::string>> file_cache;
             auto& lines = file_cache[file];
             if (lines.empty()) {
                 std::ifstream f(file);
-                if (!f || !std::getline(f, lines.emplace_back())) {
-                    std::cout << "Cannot read source file: " << file << "\n" << std::flush;
+                if (!f) {
+                    os << "  (cannot read source file: " << file << ")\n";
+                    return;
+                }
+                std::string line;
+                if (!std::getline(f, lines.emplace_back())) {
+                    os << "  (empty source file: " << file << ")\n";
                     lines.clear();
                     file_cache.erase(file);
                     return;
                 }
-                // Reinsert first line and read the rest
-                std::string line;
                 while (std::getline(f, line)) lines.push_back(line);
             }
 
@@ -402,10 +614,15 @@ namespace ppstep {
 
             for (int i = start; i < end; ++i) {
                 char marker = (i == current - 1) ? '>' : ' ';
-                std::cout << marker << ' '
-                          << std::setw(num_width) << (i + 1) << "  "
-                          << lines[i] << '\n';
+                os << "  " << marker << " "
+                   << std::setw(num_width) << (i + 1) << " | "
+                   << lines[i] << '\n';
             }
+        }
+
+        template <class ContextT>
+        void list_source(ContextT& ctx, int context_lines = 5) {
+            print_source_context(std::cout, ctx, context_lines);
             std::cout << std::flush;
         }
 
@@ -421,65 +638,85 @@ namespace ppstep {
             using qi::eol;
             using qi::phrase_parse;
             using ascii::char_;
-            using ascii::space;
-            using ascii::space_type;
+                        using ascii::space;
+                        using ascii::space_type;
+            
+                        auto anything = +(print);
+            
+            #define PPSTEP_ACTION(...) ([this, &ctx](auto const& attr){ __VA_ARGS__; })
+            
+                        qi::rule<Iterator, ascii::space_type> grammar =
+                            // Quit first: `q` is one character and would otherwise
+                            // commit inside the step/continue/expand rules (each
+                            // has a single-letter alias) before this rule is reached.
+                            (lit("quit") | lit("q") | lit("exit"))[PPSTEP_ACTION(quit())]
+                          | lexeme[lit("set") >> +space >> (
+                              ( lit("color") >> +space >> (
+                                  lit("always")[PPSTEP_ACTION(set_color_always())]
+                                | lit("on")[PPSTEP_ACTION(set_color_always())]
+                                | lit("never")[PPSTEP_ACTION(set_color_never())]
+                                | lit("off")[PPSTEP_ACTION(set_color_never())]
+                                | lit("auto")[PPSTEP_ACTION(set_color_auto())]
+                              ))
+                            | ( lit("verbose") >> +space >> (
+                                  lit("on")[PPSTEP_ACTION(set_verbose(true))]
+                                | lit("true")[PPSTEP_ACTION(set_verbose(true))]
+                                | lit("off")[PPSTEP_ACTION(set_verbose(false))]
+                                | lit("false")[PPSTEP_ACTION(set_verbose(false))]
+                              ))
+                            )]
+                          | lexeme[(lit("step") | lit("s")) >> -(+space >> uint_)][PPSTEP_ACTION(step(attr))]
+                          | (lit("finish") | lit("fin"))[PPSTEP_ACTION(finish())]
+                          | (lit("continue") | lit("c"))[PPSTEP_ACTION(step_continue())]
+                          | lexeme[((lit("backtrace") | lit("bt")) >> +space >> uint_)[PPSTEP_ACTION(expanding_trace(boost::fusion::at_c<1>(attr)))]]
+                          | lexeme[(lit("backtrace") | lit("bt"))[PPSTEP_ACTION(expanding_trace())]]
+                          | lexeme[((lit("forwardtrace") | lit("ft")) >> +space >> uint_)[PPSTEP_ACTION(rescanning_trace(boost::fusion::at_c<1>(attr)))]]
+                          | lexeme[(lit("forwardtrace") | lit("ft"))[PPSTEP_ACTION(rescanning_trace())]]
+                          | lexeme[
+                              (lit("break") | lit("b")) >> *space > (
+                                    ((lit("call") | lit("c")) > +space > anything[PPSTEP_ACTION(add_breakpoint(attr, preprocessing_event_type::CALL))])
+                                  | ((lit("expand") | lit("e")) > +space > anything[PPSTEP_ACTION(add_breakpoint(attr, preprocessing_event_type::EXPANDED))])
+                                  | ((lit("rescan") | lit("r")) > +space > anything[PPSTEP_ACTION(add_breakpoint(attr, preprocessing_event_type::RESCANNED))])
+                                  | ((lit("lex") | lit("l")) > +space > anything[PPSTEP_ACTION(add_breakpoint(attr, preprocessing_event_type::LEXED))])
+                            )]
+                          | lexeme[
+                              (lit("delete") | lit("d")) >> *space > (
+                                    ((lit("call") | lit("c")) > +space > anything[PPSTEP_ACTION(remove_breakpoint(attr, preprocessing_event_type::CALL))])
+                                  | ((lit("expand") | lit("e")) > +space > anything[PPSTEP_ACTION(remove_breakpoint(attr, preprocessing_event_type::EXPANDED))])
+                                  | ((lit("rescan") | lit("r")) > +space > anything[PPSTEP_ACTION(remove_breakpoint(attr, preprocessing_event_type::RESCANNED))])
+                                  | ((lit("lex") | lit("l")) > +space > anything[PPSTEP_ACTION(remove_breakpoint(attr, preprocessing_event_type::LEXED))])
+                            )]
+                          | lexeme[(lit("expand") | lit("e")) > +space > anything[PPSTEP_ACTION(expand_macro(ctx, attr))]]
+                          | lexeme[lit("#define") > +space > anything[PPSTEP_ACTION(define_macro(ctx, attr))]]
+                          | lexeme[lit("#undef") > +space > anything[PPSTEP_ACTION(undefine_macro(ctx, attr))]]
+                          | lexeme[lit("#include") > +space > anything[PPSTEP_ACTION(include_file(ctx, attr))]]
 
-            auto anything = +(print);
+                          | ((lit("info") | lit("i")) >> eoi)[PPSTEP_ACTION(show_info_summary(ctx))]
+                          | lexeme[(lit("info") | lit("i")) >> +space > (
+                                (lit("breakpoints") | lit("b"))[PPSTEP_ACTION(list_breakpoints())]
+                              | (lit("macros") | lit("m"))[PPSTEP_ACTION(show_macros(ctx))]
+                              | (lit("args") | lit("a"))[PPSTEP_ACTION(show_args(ctx))]
+                              | (lit("events") | lit("e"))[PPSTEP_ACTION(show_recent_events(ctx))]
+                              | (lit("events") | lit("e")) >> +space >> uint_[PPSTEP_ACTION(show_recent_events(ctx, attr))]
+                            )]
 
-#define PPSTEP_ACTION(...) ([this, &ctx](auto const& attr){ __VA_ARGS__; })
+                          | lexeme[(lit("delete") | lit("d")) >> +space >> uint_[PPSTEP_ACTION(remove_breakpoint_by_id(attr))]]
 
-            qi::rule<Iterator, ascii::space_type> grammar =
-                lexeme[(lit("step") | lit("s")) >> -(+space >> uint_)][PPSTEP_ACTION(step(attr))]
-              | (lit("continue") | lit("c"))[PPSTEP_ACTION(step_continue())]
-              | lexeme[((lit("backtrace") | lit("bt")) >> +space >> uint_)[PPSTEP_ACTION(expanding_trace(boost::fusion::at_c<1>(attr)))]]
-              | lexeme[(lit("backtrace") | lit("bt"))[PPSTEP_ACTION(expanding_trace())]]
-              | lexeme[((lit("forwardtrace") | lit("ft")) >> +space >> uint_)[PPSTEP_ACTION(rescanning_trace(boost::fusion::at_c<1>(attr)))]]
-              | lexeme[(lit("forwardtrace") | lit("ft"))[PPSTEP_ACTION(rescanning_trace())]]
-              | lexeme[
-                  (lit("break") | lit("b")) >> *space > (
-                        ((lit("call") | lit("c")) > +space > anything[PPSTEP_ACTION(add_breakpoint(attr, preprocessing_event_type::CALL))])
-                      | ((lit("expand") | lit("e")) > +space > anything[PPSTEP_ACTION(add_breakpoint(attr, preprocessing_event_type::EXPANDED))])
-                      | ((lit("rescan") | lit("r")) > +space > anything[PPSTEP_ACTION(add_breakpoint(attr, preprocessing_event_type::RESCANNED))])
-                      | ((lit("lex") | lit("l")) > +space > anything[PPSTEP_ACTION(add_breakpoint(attr, preprocessing_event_type::LEXED))])
-                )]
-              | lexeme[
-                  (lit("delete") | lit("d")) >> *space > (
-                        ((lit("call") | lit("c")) > +space > anything[PPSTEP_ACTION(remove_breakpoint(attr, preprocessing_event_type::CALL))])
-                      | ((lit("expand") | lit("e")) > +space > anything[PPSTEP_ACTION(remove_breakpoint(attr, preprocessing_event_type::EXPANDED))])
-                      | ((lit("rescan") | lit("r")) > +space > anything[PPSTEP_ACTION(remove_breakpoint(attr, preprocessing_event_type::RESCANNED))])
-                      | ((lit("lex") | lit("l")) > +space > anything[PPSTEP_ACTION(remove_breakpoint(attr, preprocessing_event_type::LEXED))])
-                )]
-              | lexeme[(lit("expand") | lit("e")) > +space > anything[PPSTEP_ACTION(expand_macro(ctx, attr))]]
-
-              | lexeme[lit("#define") > +space > anything[PPSTEP_ACTION(define_macro(ctx, attr))]]
-              | lexeme[lit("#undef") > +space > anything[PPSTEP_ACTION(undefine_macro(ctx, attr))]]
-              | lexeme[lit("#include") > +space > anything[PPSTEP_ACTION(include_file(ctx, attr))]]
-
-              | lexeme[(lit("info") | lit("i")) >> +space > (
-                    (lit("breakpoints") | lit("b"))[PPSTEP_ACTION(list_breakpoints())]
-                  | (lit("macros") | lit("m"))[PPSTEP_ACTION(show_macros(ctx))]
-                  | (lit("events") | lit("e"))[PPSTEP_ACTION(show_recent_events(ctx))]
-                  | (lit("events") | lit("e")) >> +space >> uint_[PPSTEP_ACTION(show_recent_events(ctx, attr))]
-                )]
-
-              | lexeme[(lit("delete") | lit("d")) >> +space >> uint_[PPSTEP_ACTION(remove_breakpoint_by_id(attr))]]
-
-              | (lit("what") | lit("?"))[PPSTEP_ACTION(explain_current_state())]
-              | (lit("list") | lit("l"))[PPSTEP_ACTION(list_source(ctx))]
-              | lit("macros")[PPSTEP_ACTION(show_macros(ctx))]
-              | (lit("help") | lit("h") | lit("i"))[PPSTEP_ACTION(show_help())]
-              | (lit("quit") | lit("q") | lit("exit"))[PPSTEP_ACTION(quit())]
-              | eoi[PPSTEP_ACTION(current_state(ctx))];
-
-#undef PPSTEP_ACTION
-
-            qi::on_error<qi::fail>(grammar, [](auto const& args, auto const& ctx, auto const&) {
-                std::cout << "Found unexpected argument \"" << boost::fusion::at_c<2>(args) << "\" while parsing \"" << boost::fusion::at_c<0>(args) << "\". Expected: " << boost::fusion::at_c<3>(args) << std::endl;
-            });
-
-            bool r = phrase_parse(first, last, grammar, space);
-            if (first != last) {
-                return false;
+                          | (lit("what") | lit("?"))[PPSTEP_ACTION(explain_current_state())]
+                          | (lit("list") | lit("l"))[PPSTEP_ACTION(list_source(ctx))]
+                          | lit("macros")[PPSTEP_ACTION(show_macros(ctx))]
+                          | (lit("help") | lit("h") | lit("i"))[PPSTEP_ACTION(show_help())]
+                          | eoi[PPSTEP_ACTION(current_state(ctx))];
+            
+            #undef PPSTEP_ACTION
+            
+                        qi::on_error<qi::fail>(grammar, [](auto const& args, auto const& ctx, auto const&) {
+                            std::cout << "Found unexpected argument \"" << boost::fusion::at_c<2>(args) << "\" while parsing \"" << boost::fusion::at_c<0>(args) << "\". Expected: " << boost::fusion::at_c<3>(args) << std::endl;
+                        });
+            
+                        bool r = phrase_parse(first, last, grammar, space);
+                        if (first != last) {
+                            return false;
             }
             return r;
         }
@@ -504,6 +741,23 @@ namespace ppstep {
 
             if (print_state) current_state(ctx);
 
+            // Print a banner ABOVE the prompt line — used to surface the
+            // `#define` of the macro being entered, so the user can see
+            // what the call is about to substitute without leaving the prompt.
+            if (!trigger.empty() && trigger.compare(0, 8, "calling ") == 0) {
+                std::string name = trigger.substr(8);  // strip "calling " prefix
+                // Macro names don't contain spaces; trim any trailing junk
+                // (e.g. if the trigger had extra characters appended).
+                auto sp = name.find(' ');
+                if (sp != std::string::npos) name = name.substr(0, sp);
+                std::cout << cl.make_calling_banner(name, ctx);
+            } else if (!trigger.empty() && trigger.compare(0, 10, "rescanned ") == 0) {
+                std::string name = trigger.substr(10);
+                auto sp = name.find(' ');
+                if (sp != std::string::npos) name = name.substr(0, sp);
+                std::cout << cl.make_rescanned_banner(name);
+            }
+
             auto prompt = std::string("pp");
             if (!prefix.empty()) {
                 prompt += " [" + prefix + ']';
@@ -515,7 +769,9 @@ namespace ppstep {
 
             for (char* raw_line; (raw_line = linenoise(prompt.c_str())) != nullptr;) {
                 bool empty = (raw_line[0] == '\0');
-                if (empty && (!last_repeatable || last_command.empty())) {
+                if (empty && last_command.empty()) {
+                    // No stepping command has been issued yet — empty
+                    // <Enter> is a no-op rather than running undefined state.
                     std::free(static_cast<void*>(raw_line));
                     continue;
                 }
@@ -548,6 +804,7 @@ namespace ppstep {
                         {"what","what"}, {"?","what"},
                         {"macros","macros"},
                         {"list","list"}, {"l","list"},
+                        {"set","set"},
                         {"quit","quit"}, {"q","quit"}, {"exit","quit"},
                         {"#define","#define"}, {"#undef","#undef"}, {"#include","#include"},
                     };
@@ -588,7 +845,12 @@ namespace ppstep {
                 bool valid = parse(ctx, cmd, cmd + std::strlen(cmd));
                 if (!valid) {
                     std::cout << "Undefined command: \"" << cmd << "\"." << std::endl;
-                } else {
+                } else if (last_repeatable) {
+                    // Only stepping commands (step / continue / finish) update
+                    // the <Enter>-repeat slot. Non-stepping commands
+                    // (help, list, break, delete, info, define, etc.) leave
+                    // last_command alone, so empty <Enter> keeps replaying
+                    // the most recent stepping command.
                     last_command = cmd;
                 }
 

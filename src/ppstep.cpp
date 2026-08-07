@@ -6,6 +6,7 @@
 #include <iostream>
 #include <list>
 #include <vector>
+#include <unistd.h>
 
 #include <boost/wave.hpp>
 #include <boost/wave/cpplexer/cpp_lex_token.hpp>
@@ -16,6 +17,7 @@
 
 #include "client.hpp"
 #include "server.hpp"
+#include "utils.hpp"
 
 
 namespace po = boost::program_options;
@@ -128,6 +130,9 @@ int main(int argc, char const** argv) {
     }
 
     ppstep::linenoise_init();
+
+    // Auto-enable color when stdout is a TTY; user can override via `set color`.
+    ppstep::set_color_enabled(isatty(STDOUT_FILENO) != 0);
 
     auto first = ctx.begin();
     auto last = ctx.end();
