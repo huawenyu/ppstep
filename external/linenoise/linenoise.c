@@ -103,6 +103,14 @@
  *
  */
 
+/* strdup / strcasecmp are POSIX/BSD, not ISO C. Declare the feature-test
+ * macros before any system header so the prototypes are visible under
+ * strict c11 (without these, strdup is implicitly declared as returning
+ * int, which truncates the pointer and corrupts the history list on save).
+ * _DEFAULT_SOURCE covers both strdup (POSIX) and strcasecmp (BSD). */
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE
+#endif
 #include <termios.h>
 #include <unistd.h>
 #include <stdlib.h>

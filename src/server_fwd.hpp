@@ -4,7 +4,10 @@
 namespace ppstep {
     template <class TokenT, class ContainerT>
     struct server;
-    
+
+    template <class ContainerT>
+    struct expansion_frame;
+
     template <class ContainerT>
     struct server_state;
 }

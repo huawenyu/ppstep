@@ -94,7 +94,7 @@ inline void linenoise_init() {
                         linenoiseAddCompletion(lc, name.c_str());
             }
         } else if (context == "i" || context == "info") {
-            add_matching({"breakpoints", "macros", "args", "events"});
+            add_matching({"breakpoints", "macros", "args", "events", "stack", "disabled", "macro"});
         } else if (context == "set" || context == "s") {
             // Only treat `set` as first word — drop the noisy `s` from completion
             // since `s` is already `step`. Just complete subcommands.
@@ -135,10 +135,19 @@ namespace ppstep {
         template <class Attr>
         void step(Attr const& attr) {
             if (attr) {
+                // `step N`: step over exactly N preprocessing events of any
+                // kind (including LEXED tokens) — fine-grained token-level
+                // stepping when the user asks for a specific count.
                 auto n = boost::fusion::at_c<1>(*attr);
                 steps_requested = (n > 0) ? n : 1;
+                cl.set_mode(stepping_mode::FREE);
             } else {
+                // Bare `step`: behave like `next` — skip LEXED (non-macro)
+                // events and stop at the next macro event (call/expand/rescan).
+                // Stopping at every single source token by default is noisy and
+                // rarely useful; the user can `step 1` for that.
                 steps_requested = 1;
+                cl.set_mode(stepping_mode::UNTIL_MACRO);
             }
             last_repeatable = true;
         }
@@ -156,6 +165,12 @@ namespace ppstep {
         void step_continue() {
             steps_requested = 1;
             cl.set_mode(stepping_mode::UNTIL_BREAK);
+            last_repeatable = true;
+        }
+
+        void step_next() {
+            steps_requested = 1;
+            cl.set_mode(stepping_mode::UNTIL_MACRO);
             last_repeatable = true;
         }
         
@@ -242,20 +257,86 @@ namespace ppstep {
             std::cout << std::flush;
         }
         
-        void expanding_trace(int limit = -1) {
+        // `bt` / `backtrace`: show the expansion call stack. With `full=true`
+        // (the `bt full` form) each frame also prints its bound param←arg
+        // bindings — the gdb `bt full` analogue. Frame #0 is the innermost
+        // (currently-expanding) call.
+        template <class ContextT>
+        void expanding_trace(ContextT& ctx, int limit = -1, bool full = false) {
             auto const& expanding = cl.get_state().expanding;
 
             std::size_t idx = 0;
             auto it = expanding.rbegin();
             auto end = expanding.rend();
             for (; it != end && (limit < 0 || idx < (std::size_t)limit); ++it, ++idx) {
-                std::cout << idx << ": ";
-                print_token_container(std::cout, *it) << std::endl;
+                std::cout << "#" << idx << "  ";
+                if (it->call.empty()) {
+                    std::cout << "(empty frame)\n";
+                    continue;
+                }
+                std::string name(it->call.begin()->get_value().c_str());
+                std::cout << name;
+                if (idx == 0) std::cout << "  <- current";
+                std::cout << '\n';
+
+                if (full) {
+                    print_frame_args(std::cout, ctx, name, it->arguments);
+                }
             }
             if (it != end)
-                std::cout << "... (" << (expanding.size() - idx) << " more frames)\n" << std::flush;
-            else
-                std::cout << std::flush;
+                std::cout << "... (" << (expanding.size() - idx) << " more frames)\n";
+            std::cout << std::flush;
+        }
+
+        // Pretty-print the param←arg bindings for one expansion frame. Looks
+        // up the macro's formal parameters via the wave context so the labels
+        // match the definition, then pairs them with the argument token-lists
+        // captured on the frame. Shared by `bt full` and `info stack`.
+        template <class ContextT>
+        static void print_frame_args(std::ostream& os, ContextT& ctx,
+                                     std::string const& name,
+                                     std::vector<ContainerT> const& arguments) {
+            bool has_params = false, is_predefined = false;
+            typename ContextT::position_type pos;
+            std::vector<typename ContextT::token_type> parameters;
+            typename ContextT::token_sequence_type definition;
+            try {
+                ctx.get_macro_definition(name, has_params, is_predefined, pos, parameters, definition);
+            } catch (...) {
+                os << "    (definition lookup failed)\n";
+                return;
+            }
+            if (!has_params) {
+                os << "    object-like — no arguments\n";
+                return;
+            }
+            if (parameters.empty() && arguments.empty()) {
+                os << "    (no parameters, no arguments)\n";
+                return;
+            }
+            // Uniform param-column width so the arrows line up.
+            std::size_t name_w = 0;
+            for (auto const& p : parameters) {
+                std::size_t w = std::strlen(p.get_value().c_str());
+                if (w > name_w) name_w = w;
+            }
+            std::size_t n = std::min(parameters.size(), arguments.size());
+            for (std::size_t i = 0; i < n; ++i) {
+                os << "    ";
+                os << parameters[i].get_value().c_str();
+                std::size_t pad = name_w - std::strlen(parameters[i].get_value().c_str());
+                for (std::size_t k = 0; k < pad; ++k) os << ' ';
+                os << " \xe2\x86\x90 ";  // ←
+                print_token_container(os, arguments[i]);
+                os << '\n';
+            }
+            if (parameters.size() > arguments.size()) {
+                os << "    (missing " << (parameters.size() - arguments.size())
+                   << " arg(s))\n";
+            } else if (arguments.size() > parameters.size()) {
+                os << "    (" << (arguments.size() - parameters.size())
+                   << " extra arg(s) ignored)\n";
+            }
         }
 
         void rescanning_trace(int limit = -1) {
@@ -287,22 +368,28 @@ namespace ppstep {
                 "ppstep — C preprocessor macro-expansion debugger\n"
                 "\n"
                 "Stepping:\n"
-                "  step [N] / s [N]       Step forward N preprocessing events (default 1)\n"
-                "  finish / fin            Run until current macro expansion completes\n"
+                "  step / s                Step to next macro event (skip non-macro tokens)\n"
+                "  step N / s N            Step forward exactly N preprocessing events (any kind)\n"
+                "  next / n                Same as bare `step` (step to next macro event)\n"
+                "  finish / fin            Run until the current (top-level) macro finishes\n"
                 "  continue / c            Continue until breakpoint or end\n"
                 "\n"
                 "Breakpoints:\n"
-                "  break <type> <macro> / b <t> <m>   Set breakpoint\n"
-                "  delete <type> <macro> / d <t> <m>  Remove breakpoint by name\n"
+                "  break [<type>] <macro> / b [<t>] <m>  Set breakpoint (type defaults to call)\n"
+                "  delete [<type>] <macro> / d [<t>] <m> Remove breakpoint by name (type defaults to call)\n"
                 "  delete <N> / d <N>                 Remove breakpoint by number\n"
                 "  delete / d                         Remove all breakpoints\n"
                 "  info breakpoints / i b             List breakpoints\n"
                 "    types: call/c, expand/e, rescan/r, lex/l\n"
                 "  info args / i a                    Show arg → param bindings at current call\n"
+                "  info stack / i s                    Show all expansion frames with bound args\n"
+                "  info disabled / i d                Show macros painted blue (per-rescan-scope disabled set)\n"
+                "  info macro <name> / i M <name>     Show a macro's definition + call-stack depth\n"
                 "\n"
                 "Inspection:\n"
                 "  list / l                 Show source code around current position\n"
                 "  backtrace [N] / bt [N]   Show expansion stack (last N frames)\n"
+                "  backtrace full / bt full Show expansion stack with bound args per frame\n"
                 "  forwardtrace [N] / ft [N] Show rescanning stack (last N frames)\n"
                 "  info macros / i m        List defined macros\n"
                 "  info events / i e        Show recent preprocessing events\n"
@@ -331,7 +418,14 @@ namespace ppstep {
         }
 
         void quit() {
-            throw session_terminate();
+            // Set a flag instead of throwing here: throwing from inside the
+            // linenoise completion/callback would unwind across the C
+            // `linenoise` call frame (undefined behavior, crashes on exit).
+            // The prompt loop checks `want_quit` after each `parse()` and
+            // breaks cleanly; `prompt()` then re-throws `session_terminate`
+            // from a fully C++ call stack (no C frame in between), which
+            // `ppstep.cpp`'s main loop catches to stop preprocessing.
+            want_quit = true;
         }
 
         void set_color_always() {
@@ -357,17 +451,34 @@ namespace ppstep {
 
         void finish() {
             auto const& st = cl.get_state();
-            if (st.expanding.empty()) {
-                std::cout << "Not currently expanding a macro. "
-                             "Step until the call site is reached, then `finish`.\n" << std::flush;
+            if (st.expanding.empty() && st.rescanning.empty()) {
+                std::cout << "No macro expansion in progress.\n" << std::flush;
                 return;
             }
-            auto const& top = st.expanding.back();
-            std::cout << "Finishing expansion of: "
-                      << (top.empty() ? "<empty>" : std::string(top.begin()->get_value().c_str()))
-                      << "  (depth " << st.expanding.size() << ")\n" << std::flush;
+            // The "current working macro" is the top-level macro the frames-log
+            // closer labels `working:` — the outermost live frame. Pick it the
+            // same way the closer does: rescanning.front() when a rescan is
+            // running (nested calls happen DURING the rescan, so the oldest
+            // rescan frame is the true top-level), else expanding.front().
+            std::string name = "<unknown>";
+            if (!st.rescanning.empty()) {
+                name = st.rescanning.front().first.empty()
+                    ? "<empty>"
+                    : std::string(st.rescanning.front().first.begin()->get_value().c_str());
+            } else if (!st.expanding.empty()) {
+                name = st.expanding.front().call.empty()
+                    ? "<empty>"
+                    : std::string(st.expanding.front().call.begin()->get_value().c_str());
+            }
+            std::cout << "Finishing expansion of: " << name
+                      << "  (run until result)\n" << std::flush;
             cl.arm_finish();
             cl.set_mode(stepping_mode::UNTIL_BREAK);
+            // Like `continue`, set steps_requested so the prompt loop breaks
+            // out and preprocessing resumes. Without this, `finish` set the
+            // mode but never returned to the main loop, so it just re-read
+            // the next command and never actually ran.
+            steps_requested = 1;
             last_repeatable = true;
         }
 
@@ -410,12 +521,12 @@ namespace ppstep {
             if (st.expanding.empty()) {
                 std::cout << "  Not currently inside any macro expansion.\n";
             } else {
-                auto print_frame = [&](char const* label, ContainerT const& frame) {
-                    if (frame.empty()) {
+                auto print_frame = [&](char const* label, expansion_frame<ContainerT> const& frame) {
+                    if (frame.call.empty()) {
                         std::cout << "  " << label << " : (empty frame)\n\n";
                         return;
                     }
-                    std::string name(frame.begin()->get_value().c_str());
+                    std::string name(frame.call.begin()->get_value().c_str());
                     std::cout << "  " << label << " : " << name;
 
                     bool has_params = false, is_predefined = false;
@@ -548,6 +659,127 @@ namespace ppstep {
                 event.print_args(std::cout, ctx);
             }, latest->event);
         }
+
+        // `info stack` / `i s`: every expansion frame with bound args at each
+        // level — the gdb `bt full` analogue. Frame #0 is the innermost
+        // (currently-expanding) call. Reuses `expanding_trace(full=true)`.
+        template <class ContextT>
+        void show_stack(ContextT& ctx) {
+            auto const& st = cl.get_state();
+            if (st.expanding.empty()) {
+                std::cout << "Not currently inside any macro expansion.\n"
+                          << std::flush;
+                return;
+            }
+            std::cout << "Expansion stack (depth " << st.expanding.size()
+                      << ", innermost first):\n";
+            expanding_trace(ctx, -1, true);
+        }
+
+        // `info disabled` / `i d`: the "painted-blue" disabled set. A macro is
+        // disabled for exactly the lifetime of its rescan frame (pushed in
+        // `expanded_macro`, popped in `rescanned_macro`), so the disabled set
+        // is the union of `cause` names across all live `rescanning` frames.
+        // Innermost (current rescan) first; a macro expanding twice nested
+        // shows once, at the deeper scope. Empty when no rescan is in progress.
+        void show_disabled() {
+            auto const& rescanning = cl.get_state().rescanning;
+            if (rescanning.empty()) {
+                std::cout << "No macros disabled (no rescan in progress).\n"
+                          << std::flush;
+                return;
+            }
+            // Union of cause names, innermost-first, dedup preserving
+            // first-seen order (matches frames_pane_lines()).
+            std::vector<std::string> names;
+            for (auto it = rescanning.rbegin(); it != rescanning.rend(); ++it) {
+                auto const& cause = it->first;
+                if (cause.empty()) continue;
+                std::string n(cause.begin()->get_value().c_str());
+                if (std::find(names.begin(), names.end(), n) == names.end()) {
+                    names.push_back(n);
+                }
+            }
+            std::cout << "Disabled (painted blue), innermost-first:\n";
+            for (std::size_t i = 0; i < names.size(); ++i) {
+                std::cout << "  #" << i << "  " << names[i] << "\n";
+            }
+            std::cout << std::flush;
+        }
+
+        // `info macro NAME` / `i M NAME`: single-macro introspection. Looks
+        // up the macro by name and pretty-prints its params, body, predefined
+        // flag, and current expansion depth (how many frames on the call
+        // stack are expanding this macro right now). Handles "macro not found"
+        // cleanly. Promotes the internal lookup already used by
+        // `print_verbose`/`print_args` to a first-class command.
+        template <class ContextT, class Attr>
+        void show_macro(ContextT& ctx, Attr const& attr) {
+            std::string name(attr.begin(), attr.end());
+
+            // wave's get_macro_definition does not throw for unknown names —
+            // it returns an empty object-like definition. So check existence
+            // explicitly first.
+            if (!ctx.is_defined_macro(name)) {
+                std::cout << "No macro named \"" << name << "\" is currently defined.\n"
+                          << std::flush;
+                return;
+            }
+
+            bool has_params = false, is_predefined = false;
+            typename ContextT::position_type pos;
+            std::vector<typename ContextT::token_type> parameters;
+            typename ContextT::token_sequence_type definition;
+            try {
+                ctx.get_macro_definition(name, has_params, is_predefined, pos, parameters, definition);
+            } catch (...) {
+                std::cout << "No macro named \"" << name << "\" is currently defined.\n"
+                          << std::flush;
+                return;
+            }
+
+            std::cout << name;
+            if (has_params) {
+                std::cout << '(';
+                for (std::size_t i = 0; i < parameters.size(); ++i) {
+                    if (i) std::cout << ", ";
+                    std::cout << parameters[i].get_value().c_str();
+                }
+                std::cout << ')';
+            }
+            if (is_predefined) std::cout << "   (predefined)";
+            std::cout << '\n';
+
+            if (has_params) {
+                std::cout << "  params: ";
+                for (std::size_t i = 0; i < parameters.size(); ++i) {
+                    if (i) std::cout << ", ";
+                    std::cout << parameters[i].get_value().c_str();
+                }
+                std::cout << '\n';
+            }
+
+            std::cout << "  body  : ";
+            std::string body;
+            for (auto const& t : definition) body += t.get_value().c_str();
+            constexpr std::size_t max_body = 72;
+            if (body.size() > max_body) body = body.substr(0, max_body - 3) + "...";
+            std::cout << body << '\n';
+
+            // Current expansion depth for this macro: count frames on the
+            // call stack whose call tokens begin with this name.
+            std::size_t depth = 0;
+            for (auto const& frame : cl.get_state().expanding) {
+                if (!frame.call.empty() &&
+                    frame.call.begin()->get_value().c_str() == name) {
+                    ++depth;
+                }
+            }
+            std::cout << "  on call stack: " << depth << " frame"
+                      << (depth == 1 ? "" : "s") << '\n';
+
+            std::cout << std::flush;
+        }
         
         void explain_current_state() {
             auto latest = cl.newest_history();
@@ -672,8 +904,11 @@ namespace ppstep {
                           | lexeme[(lit("step") | lit("s")) >> -(+space >> uint_)][PPSTEP_ACTION(step(attr))]
                           | (lit("finish") | lit("fin"))[PPSTEP_ACTION(finish())]
                           | (lit("continue") | lit("c"))[PPSTEP_ACTION(step_continue())]
-                          | lexeme[((lit("backtrace") | lit("bt")) >> +space >> uint_)[PPSTEP_ACTION(expanding_trace(boost::fusion::at_c<1>(attr)))]]
-                          | lexeme[(lit("backtrace") | lit("bt"))[PPSTEP_ACTION(expanding_trace())]]
+                          | (lit("next") | lit("n"))[PPSTEP_ACTION(step_next())]
+                          | lexeme[((lit("backtrace") | lit("bt")) >> +space >> lit("full"))[PPSTEP_ACTION(expanding_trace(ctx, -1, true))]]
+                          | lexeme[((lit("backtrace") | lit("bt")) >> +space >> uint_ >> +space >> lit("full"))[PPSTEP_ACTION(expanding_trace(ctx, boost::fusion::at_c<1>(attr), true))]]
+                          | lexeme[((lit("backtrace") | lit("bt")) >> +space >> uint_)[PPSTEP_ACTION(expanding_trace(ctx, boost::fusion::at_c<1>(attr)))]]
+                          | lexeme[(lit("backtrace") | lit("bt"))[PPSTEP_ACTION(expanding_trace(ctx))]]
                           | lexeme[((lit("forwardtrace") | lit("ft")) >> +space >> uint_)[PPSTEP_ACTION(rescanning_trace(boost::fusion::at_c<1>(attr)))]]
                           | lexeme[(lit("forwardtrace") | lit("ft"))[PPSTEP_ACTION(rescanning_trace())]]
                           | lexeme[
@@ -682,6 +917,8 @@ namespace ppstep {
                                   | ((lit("expand") | lit("e")) > +space > anything[PPSTEP_ACTION(add_breakpoint(attr, preprocessing_event_type::EXPANDED))])
                                   | ((lit("rescan") | lit("r")) > +space > anything[PPSTEP_ACTION(add_breakpoint(attr, preprocessing_event_type::RESCANNED))])
                                   | ((lit("lex") | lit("l")) > +space > anything[PPSTEP_ACTION(add_breakpoint(attr, preprocessing_event_type::LEXED))])
+                                  // Bare `b <macro>` defaults to a CALL breakpoint.
+                                  | anything[PPSTEP_ACTION(add_breakpoint(attr, preprocessing_event_type::CALL))]
                             )]
                           | lexeme[
                               (lit("delete") | lit("d")) >> *space > (
@@ -689,6 +926,8 @@ namespace ppstep {
                                   | ((lit("expand") | lit("e")) > +space > anything[PPSTEP_ACTION(remove_breakpoint(attr, preprocessing_event_type::EXPANDED))])
                                   | ((lit("rescan") | lit("r")) > +space > anything[PPSTEP_ACTION(remove_breakpoint(attr, preprocessing_event_type::RESCANNED))])
                                   | ((lit("lex") | lit("l")) > +space > anything[PPSTEP_ACTION(remove_breakpoint(attr, preprocessing_event_type::LEXED))])
+                                  // Bare `d <macro>` defaults to a CALL breakpoint.
+                                  | anything[PPSTEP_ACTION(remove_breakpoint(attr, preprocessing_event_type::CALL))]
                             )]
                           | lexeme[(lit("expand") | lit("e")) > +space > anything[PPSTEP_ACTION(expand_macro(ctx, attr))]]
                           | lexeme[lit("#define") > +space > anything[PPSTEP_ACTION(define_macro(ctx, attr))]]
@@ -698,6 +937,9 @@ namespace ppstep {
                           | ((lit("info") | lit("i")) >> eoi)[PPSTEP_ACTION(show_info_summary(ctx))]
                           | lexeme[(lit("info") | lit("i")) >> +space > (
                                 (lit("breakpoints") | lit("b"))[PPSTEP_ACTION(list_breakpoints())]
+                              | (lit("stack") | lit("s"))[PPSTEP_ACTION(show_stack(ctx))]
+                              | (lit("disabled") | lit("d"))[PPSTEP_ACTION(show_disabled())]
+                              | (lit("macro") | lit("M")) >> +space > anything[PPSTEP_ACTION(show_macro(ctx, attr))]
                               | (lit("macros") | lit("m"))[PPSTEP_ACTION(show_macros(ctx))]
                               | (lit("args") | lit("a"))[PPSTEP_ACTION(show_args(ctx))]
                               | (lit("events") | lit("e"))[PPSTEP_ACTION(show_recent_events(ctx))]
@@ -782,6 +1024,7 @@ namespace ppstep {
                     static std::vector<std::pair<char const*, char const*>> commands = {
                         {"step","step"}, {"s","step"},
                         {"continue","continue"}, {"c","continue"},
+                        {"next","next"}, {"n","next"},
                         {"backtrace","backtrace"}, {"bt","backtrace"},
                         {"forwardtrace","forwardtrace"}, {"ft","forwardtrace"},
                         {"break","break"}, {"b","break"},
@@ -843,6 +1086,12 @@ namespace ppstep {
 
                 std::free(static_cast<void*>(raw_line));
 
+                if (want_quit) {
+                    // Re-throw from a C++-only call stack so the throw never
+                    // crosses the C `linenoise` frame. See `quit()`.
+                    throw session_terminate();
+                }
+
                 if (valid) {
                     if (steps_requested) break;
                 }
@@ -855,6 +1104,7 @@ namespace ppstep {
         std::string prefix;
         std::string last_command;
         bool last_repeatable = false;
+        bool want_quit = false;
     };
 }
 

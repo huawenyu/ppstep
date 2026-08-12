@@ -18,7 +18,8 @@ namespace ppstep {
     enum class stepping_mode {
         INVALID = 0,
         FREE = 1 << 0,
-        UNTIL_BREAK = 1 << 1
+        UNTIL_BREAK = 1 << 1,
+        UNTIL_MACRO = 1 << 2   // `next`: skip LEXED events, stop at next macro event
     };
 
     struct session_terminate : std::exception {

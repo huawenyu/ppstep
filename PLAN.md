@@ -186,27 +186,132 @@ etc. still match. Implementation in `src/view.hpp`,
 
 ---
 
+## Phase 5 — `info stack` / `bt full` + `info macro NAME` + quit crash fix
+
+Three pieces landed together.
+
+### `info stack` / `bt full` — per-frame bound args (the gdb `bt full` analogue)
+
+**What ships**: `info stack` (`i s`) and `bt full` print every
+expansion frame with its bound `param ← arg` tokens at each level,
+not just the call tokens. Frame #0 is the innermost
+(currently-expanding) call.
+
+```
+(pp) b call MAX
+(pp) c
+(pp) info stack
+Expansion stack (depth 2, innermost first):
+#0  MAX  <- current
+    a ← 1
+    b ← 2
+#1  MAX
+    a ← MAX ( 1 , 2 )
+    b ← 3
+```
+
+`bt full` is the same as `info stack` but reached via the
+`backtrace` verb. `bt N full` limits to N frames.
+
+**How**: `server_state::expanding` changed from
+`std::vector<ContainerT>` to
+`std::vector<expansion_frame<ContainerT>>`, where
+`expansion_frame` holds both the `call` tokens and the
+`std::vector<ContainerT> arguments` bound at that call. Arguments
+were previously carried only on the short-lived `events::call`
+struct (gone after the prompt returned); now they live for the
+lifetime of the frame on the stack. `server.hpp` pushes the
+sanitized arguments into the frame alongside the call tokens at
+`expanding_function_like_macro` / `expanding_object_like_macro`
+time. Every existing call site that read `frame.begin()->get_value()`
+was updated to `frame.call.begin()->get_value()`.
+
+The `print_frame_args` helper (in `view.hpp`) looks up the macro's
+formal parameters via `ctx.get_macro_definition` and pairs them with
+the frame's argument token-lists, so the labels match the
+definition. Shared by `bt full` and `info stack`.
+
+**Files**: `src/server.hpp` (`expansion_frame` struct,
+`server_state::expanding` retype, push sites carry args,
+`expanded_macro` reads `.call`), `src/server_fwd.hpp`
+(forward-decl `expansion_frame`), `src/client.hpp` (banner /
+frames-pane sites read `.call`), `src/view.hpp`
+(`expanding_trace(ctx, limit, full)` template,
+`print_frame_args`, `show_stack`, grammar rules for `bt full` /
+`bt N full` / `info stack`, help text, tab completion).
+
+### `info macro NAME` — first-class single-macro introspection
+
+**What ships**: `info macro <name>` (`i M <name>`) pretty-prints
+a macro's params, body, predefined flag, and current call-stack
+depth (how many frames are expanding it right now). Handles
+"macro not found" cleanly.
+
+```
+(pp) i M MAX
+MAX(a, b)
+  params: a, b
+  body  : ((a) > (b) ? (a) : (b))
+  on call stack: 1 frame
+```
+
+`i M <name>` for an undefined macro prints
+`No macro named "<name>" is currently defined.`
+
+**Why existence needs a pre-check**: wave's
+`get_macro_definition` does *not* throw for unknown names — it
+returns an empty object-like definition. So `show_macro` calls
+`ctx.is_defined_macro(name)` first; only if that's true does it
+fetch params/body.
+
+**Files**: `src/view.hpp` (`show_macro`, grammar rule
+`(lit("macro") | lit("M")) >> +space > anything`, help, tab
+completion). No `server.hpp` change — reuses the same
+`get_macro_definition` lookup as `print_verbose`/`print_args`.
+
+### Quit crash fix — `strdup` feature-test macro in linenoise.c
+
+**What shipped**: `external/linenoise/linenoise.c` was missing the
+POSIX feature-test macro, so under strict c11 `strdup` was
+implicitly declared as returning `int` (truncating the pointer),
+which corrupted the history list and crashed inside
+`linenoiseHistorySave` at exit. Any REPL session that entered the
+prompt loop and then exited (via `q` or EOF) segfaulted. Adding
+`#define _DEFAULT_SOURCE` before the first `#include` gives
+`strdup` and `strcasecmp` proper prototypes.
+
+The `quit()` path was also hardened: it previously threw
+`session_terminate` from inside the linenoise callback lambda,
+which unwinds across the C `linenoise` call frame (UB). Now
+`quit()` sets a `want_quit` flag; the prompt loop breaks cleanly
+and re-throws `session_terminate` from a C++-only call stack (no C
+frame in between), which `ppstep.cpp`'s main loop catches as
+before.
+
+**Files**: `external/linenoise/linenoise.c` (`_DEFAULT_SOURCE`),
+`src/view.hpp` (`quit()` sets flag; `prompt()` re-throws after the
+loop).
+
+---
+
 ## Brainstorm — `info` extensions worth shipping
 
 Each addresses a real "what just happened in the preprocessor?"
 question that's currently invisible.
 
-1. **`info stack`** (or extend `bt` to `bt full`) — every
-   expansion frame with **bound args** at each level. Currently
-   `bt` shows the call tokens, not the bindings. Frame #0 has
-   `a=MAX(1,2), b=3`; frame #1 has `x=2.0`, etc. This is the
-   gdb `bt full` analogue and probably the single
-   highest-leverage addition. Requires storing arguments
-   alongside each `state->expanding` frame instead of carrying
-   them only on the `events::call` short-lived struct.
+1. ~~**`info stack`** (or extend `bt` to `bt full`)~~ —
+   **Landed in Phase 5.** `info stack` / `i s` and `bt full`
+   print every expansion frame with bound `param ← arg` tokens
+   at each level. `server_state::expanding` is now
+   `std::vector<expansion_frame<ContainerT>>` carrying both the
+   call tokens and the arguments; previously args lived only on
+   the short-lived `events::call` struct.
 
-2. **`info macro NAME`** — already partially used internally
-   (`print_verbose`, `print_args`); promote to a first-class
-   command. Look up the macro by name and pretty-print (params,
-   body, where it's called from, expansion depth). Useful when
-   stepping in `expand MACRO` sub-prompts where the
-   `state->expanding` is empty and the user would otherwise have
-   no context.
+2. ~~**`info macro NAME`**~~ — **Landed in Phase 5.** `i M NAME`
+   pretty-prints params, body, predefined flag, and current
+   call-stack depth. Uses `ctx.is_defined_macro` for the
+   existence check (wave's `get_macro_definition` returns empty,
+   not throws, for unknown names).
 
 3. **`info count`** — running counters: total events,
    per-event-type totals, per-macro call totals. Cheap (one
@@ -249,12 +354,18 @@ question that's currently invisible.
 
 If continuing work after this doc:
 
-- **`info stack`** if maximum gdb-shape coverage in one shot.
-- **`info macro NAME`** for quick introspection that's already
-  half-built.
-- **`info count`** if a low-cost, high-utility stat is wanted.
+- ~~`info stack`~~ landed (Phase 5).
+- ~~`info macro NAME`~~ landed (Phase 5).
+- **`info count`** — partly done already (the bare `info`
+  summary prints per-event and per-macro counts); promote to its
+  own `info count` command if a dedicated low-cost stat is
+  wanted.
 - **`info path TOKEN`** as a long-term centerpiece teaching
   feature.
+- **`watch TOKEN`**, **`condition N EXPR`**, **`ignore N K`** —
+  breakpoint control extensions.
+- **Refactor** — split `client.hpp` / `view.hpp` into `.cpp` +
+  `.hpp` units (still overdue; both are now larger after Phase 5).
 
 ---
 
@@ -262,8 +373,9 @@ If continuing work after this doc:
 
 Pickup notes for whoever continues work on this codebase after
 me. The repo is a Boost.Wave-backed preprocessor debugger with
-its own REPL; the recent additions (Phases 1–4 above) live in
-five header files — there is no `.cpp`, just headers.
+its own REPL; the recent additions (Phases 1–5 above) live in
+five header files plus a vendored linenoise — there is no
+project `.cpp`, just headers (`ppstep.cpp` is the only TU).
 
 ### Build & smoke-test
 
@@ -292,13 +404,14 @@ target compiles fine because
 |----------------------|--------------|
 | `src/ppstep.cpp`     | `main()`; TTY init for `g_color_enabled` (auto). |
 | `src/client_fwd.hpp` | Forward decls + the `preprocessing_event_type` enum. |
-| `src/server_fwd.hpp` | Forward decls for `server`/`server_state`. |
+| `src/server_fwd.hpp` | Forward decls for `server`/`server_state`/`expansion_frame`. |
 | `src/client.hpp`     | The `client<TokenT, ContainerT>` class, the `events::*` event structs that go in `std::variant<preprocessing_event>`, and `client_cli<TokenT, ContainerT>`. (Note the unusual include direction: `client.hpp` includes `view.hpp`, not the reverse.) |
-| `src/server.hpp`     | The Boost.Wave hooks (`expanding_function_like_macro` etc.). |
-| `src/view.hpp`       | REPL grammar, `client_cli` impl, linenoise init, completion callback. Splitting this into a `.cpp` is overdue. |
+| `src/server.hpp`     | The Boost.Wave hooks (`expanding_function_like_macro` etc.) and the `expansion_frame<ContainerT>` / `server_state` definitions. |
+| `src/view.hpp`       | REPL grammar, `client_cli` impl, linenoise init, completion callback, and the `expanding_trace`/`show_stack`/`show_macro`/`print_frame_args` helpers. Splitting this into a `.cpp` is overdue. |
 | `src/utils.hpp`      | Printing helpers and `g_color_enabled`. |
+| `external/linenoise/linenoise.c` | Vendored line editor. Needs `_DEFAULT_SOURCE` (added in Phase 5) so `strdup`/`strcasecmp` get prototypes under strict c11. |
 
-### Key invariants established by Phases 1–4
+### Key invariants established by Phases 1–5
 
 1. **`g_color_enabled` is a process-global bool** in
    `utils.hpp`, set by:
@@ -314,7 +427,19 @@ target compiles fine because
 3. **Server pushes `state->expanding` *before* invoking the
    sink.** This was a Phase 3 change; it lets the `call` prompt
    reflect the new depth. If you add a new hook that pushes to
-   `state->expanding`, do push-first.
+   `state->expanding`, do push-first. The same push-before-fire
+   discipline now also applies to `state->rescanning` in
+   `expanded_macro`: the rescan-frame push happens *before*
+   `on_expanded` fires, so the `expanded` prompt sees the body
+   already queued (and, via the disabled-set derivation in 10
+   below, the macro already painted blue). `rescanned_macro`
+   still pops *after* `on_rescanned` fires, so the `rescanned`
+   prompt sees the frame still live — symmetric with `expanded`.
+4. **`finish` is depth-based, not bp-on-name.**
+   `finish_target_depth` is recorded; the next `expanded` event
+   at exactly that depth fires. Nested same-name macros
+   (e.g. `MAX(MAX(1,2),3)`) work without spuriously hitting
+   inner expansions.
 4. **`finish` is depth-based, not bp-on-name.**
    `finish_target_depth` is recorded; the next `expanded` event
    at exactly that depth fires. Nested same-name macros
@@ -330,6 +455,41 @@ target compiles fine because
    must not) include. So every event carries its own
    `print_args(os, ctx)` method, and `view.hpp::show_args`
    just calls `event.print_args(...)` after `std::visit`.
+7. **`state->expanding` is `std::vector<expansion_frame<ContainerT>>`,
+   not `std::vector<ContainerT>`.** Phase 5 change: each frame
+   carries `call` (the call tokens) and `arguments` (the
+   `std::vector<ContainerT>` of bound arg token-lists, empty for
+   object-like). Any code iterating the stack must read
+   `frame.call...`, not `frame...`. The args live for the frame's
+   lifetime, so `info stack` / `bt full` can print `param ← arg`
+   at every level — not just the innermost (which is all the
+   short-lived `events::call` struct could show before).
+8. **`quit()` does not throw across the linenoise C frame.**
+   It sets a `want_quit` flag on `client_cli`; the prompt loop
+   breaks cleanly and re-throws `session_terminate` from a
+   C++-only call stack. Throwing from inside the linenoise
+   callback lambda is UB and crashed on exit.
+9. **linenoise.c needs `_DEFAULT_SOURCE`.** Without it,
+   `strdup` is implicitly declared as returning `int` under
+   strict c11, truncating the pointer and crashing
+   `linenoiseHistorySave` at exit. If you reintroduce the file
+   or compile it elsewhere, keep the feature-test macro.
+10. **The disabled ("painted-blue") set is *derived* from
+    `state->rescanning`, not tracked separately.** A macro is
+    disabled for exactly the lifetime of its rescan frame:
+    `expanded_macro` pushes `{call, result}` onto `rescanning`
+    (the `call`/`cause` is the macro whose body is being
+    rescanned), and `rescanned_macro` pops it. So the disabled
+    set = the union of `cause` names across all live
+    `rescanning` frames, innermost-first, deduped. This is what
+    `info disabled` / `i d` and the `-- disabled (blue) --` pane
+    in the frames log print. No separate server state — deriving
+    from the same LIFO that mirrors Wave's rescan stack means it
+    cannot desync from Wave's own blue-paint set. The push-before-
+    fire reorder in invariant 3 is what makes the `expanded`
+    prompt see the macro as already blue (the push marks the
+    start of the blue window; before the reorder the prompt sat
+    before the push and missed it).
 
 ### Known quirks / things that bit me
 

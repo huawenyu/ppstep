@@ -8,10 +8,21 @@
 
 namespace ppstep {
     template <class ContainerT>
+    struct expansion_frame {
+        ContainerT call;
+        // Argument token-lists bound to this call's formal parameters, in
+        // parameter order. Empty for object-like macros. Kept on the frame
+        // (not just the short-lived events::call struct) so `info stack` /
+        // `bt full` can print param←arg bindings at every level of the
+        // expansion stack, not only the innermost.
+        std::vector<ContainerT> arguments;
+    };
+
+    template <class ContainerT>
     struct server_state {
         server_state() : expanding(), rescanning() {}
 
-        std::vector<ContainerT> expanding;
+        std::vector<expansion_frame<ContainerT>> expanding;
         std::vector<std::pair<ContainerT, ContainerT>> rescanning;
     };
 
@@ -62,7 +73,8 @@ namespace ppstep {
 
             // Push BEFORE invoking the sink so that the REPL prompt fired at
             // the `call` event reflects the new stack depth (used by `finish`).
-            state->expanding.push_back(full_call);
+            state->expanding.push_back(expansion_frame<ContainerT>{
+                full_call, sanitized_arguments});
 
             if (!debug) {
                 sink->on_expand_function(ctx, macrodef, sanitized_arguments, full_call);
@@ -80,7 +92,8 @@ namespace ppstep {
                 ContainerT const& definition, TokenT const& macrocall) {
             if (evaluating_conditional) return false;
 
-            state->expanding.push_back({macrocall});
+            state->expanding.push_back(expansion_frame<ContainerT>{
+                ContainerT{macrocall}, {}});
 
             if (!debug) {
                 sink->on_expand_object(ctx, macrocall);
@@ -97,16 +110,28 @@ namespace ppstep {
             if (evaluating_conditional) return;
 
             auto const& initial = *(state->expanding.rbegin());
-            
+
+            // Push to the rescan queue BEFORE firing on_expanded, so the prompt
+            // fired during the `expanded` event sees the body already queued for
+            // rescan — matching the same push-before-fire discipline Phase 3
+            // applied to `expanding` (server.hpp:74). Two things depend on this
+            // ordering now:
+            //   - forwardtrace / the frames-log rescan queue show the
+            //     about-to-be-rescanned body at the `expanded` prompt (instead
+            //     of hiding it for one step);
+            //   - `info disabled` / the disabled pane see the macro as painted
+            //     blue at the `expanded` prompt, since the disabled set is the
+            //     union of `rescanning` cause names and the blue window is
+            //     [push, pop] = [expanded, rescanned].
+            state->rescanning.push_back({initial.call, result});
+
             if (!debug) {
-                 sink->on_expanded(ctx, sanitize(initial), sanitize(result));
+                 sink->on_expanded(ctx, sanitize(initial.call), sanitize(result));
             } else {
                 std::cout << "E: ";
-                print_token_container(std::cout, sanitize(initial)) << " -> ";
+                print_token_container(std::cout, sanitize(initial.call)) << " -> ";
                 print_token_container(std::cout, sanitize(result)) << std::endl;
             }
-
-            state->rescanning.push_back({initial, result});
 
             state->expanding.pop_back();
         }
@@ -178,6 +203,22 @@ namespace ppstep {
         template <typename ContextT, typename ExceptionT>
         void throw_exception(ContextT& ctx, ExceptionT const& e) {
             sink->on_exception(ctx, e);
+            // Recoverable errors (missing include file, an `#if`
+            // referencing an undefined macro → "ill formed expression",
+            // a `__has_builtin`/`__has_attribute` the host doesn't
+            // provide, etc.) are NOT re-thrown: we print a warning and
+            // let Wave's iterator skip past the offending construct
+            // and continue. This keeps preprocessing going on a file
+            // whose `#include <vector>` can't be resolved from the
+            // explicitly-passed `-I` paths, or that uses compiler
+            // builtins ppstep doesn't model — the user can still
+            // step through the macros that ARE defined. Only truly
+            // fatal (non-recoverable) errors propagate to main().
+            if (e.is_recoverable()) {
+                std::cerr << "warning: " << e.what() << ": "
+                          << e.description() << std::endl;
+                return;
+            }
             boost::throw_exception(e);
         }
 

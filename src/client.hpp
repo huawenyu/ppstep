@@ -23,16 +23,21 @@
 
 namespace ppstep {
     namespace ansi {
-        constexpr auto black_fg = "\u001b[30m";
-        constexpr auto white_fg = "\u001b[37;1m";
+        // Foreground-only highlight palette. The highlight window marks a
+        // token span (the current macro call / expansion / rescan) with a
+        // bright foreground color + underline instead of a background fill.
+        // Background-inverted cells fight the terminal theme: on a dark
+        // theme the standard yellow bg ("\u001b[43m") renders as dark olive
+        // and black text on it is low contrast.  Bright fg colors on the
+        // terminal's own background stay vivid and readable on both light
+        // and dark themes; underline marks the span boundary without
+        // inverting the cell.
+        constexpr auto bright_magenta_fg = "\u001b[95m";  // call
+        constexpr auto bright_yellow_fg  = "\u001b[93m";  // expanded
+        constexpr auto bright_cyan_fg    = "\u001b[96m";  // rescanned
 
-        // Backgrounds chosen to not collide with token fg colors
-        // (cyan / white / magenta / green / yellow).
-        constexpr auto magenta_bg     = "\u001b[45;1m";  // call
-        constexpr auto yellow_bg      = "\u001b[43m";    // expanded
-        constexpr auto bright_blue_bg = "\u001b[44;1m";  // rescanned
-
-        constexpr auto bold = "\u001b[1m";
+        constexpr auto underline = "\u001b[4m";
+        constexpr auto bold      = "\u001b[1m";
 
         constexpr auto reset = "\u001b[0m";
     }
@@ -42,19 +47,36 @@ namespace ppstep {
         struct formatting_event {
             formatting_event(std::size_t start, std::size_t end) : start(start), end(end) {}
 
-            void print(std::ostream& os, ContainerT const& tokens) const {
-                auto sub_start = std::next(tokens.begin(), start);
-                auto sub_end = std::next(tokens.begin(), end);
+            // How many tokens of surrounding context to show on each side of
+            // the highlighted macro window. The full accumulated output is
+            // not useful here — it grows monotonically and re-dumps the whole
+            // file body at every stop. A small context window keeps the
+            // display compact while still showing where the macro sits.
+            static constexpr std::size_t context_radius = 8;
 
-                auto it = tokens.begin();
-                auto end = tokens.end();
+            void print(std::ostream& os, ContainerT const& tokens) const {
+                if (tokens.empty()) { os << std::endl; return; }
+
+                auto begin = tokens.begin();
+                auto total_end = tokens.end();
+                auto sub_start = std::next(begin, start);
+                auto sub_end = std::next(begin, end);
 
                 bool color = ppstep::color_enabled();
 
+                // Clamp the leading/trailing context to context_radius tokens.
+                auto ctx_begin = (start > context_radius)
+                                 ? std::next(begin, start - context_radius)
+                                 : begin;
+                auto ctx_end = (static_cast<std::size_t>(std::distance(sub_end, total_end)) > context_radius)
+                               ? std::next(sub_end, context_radius)
+                               : total_end;
+
                 if (color) os << ansi::bold;
-                print_token_range(os, it, sub_start);
-                if (it != tokens.begin())
+                if (ctx_begin != sub_start) {
+                    print_token_range(os, ctx_begin, sub_start);
                     os << ' ';
+                }
 
                 if (color) static_cast<DerivedT const*>(this)->format(os);
                 if (sub_start != sub_end) {
@@ -65,10 +87,10 @@ namespace ppstep {
                     if (color) os << ansi::reset;
                 }
                 if (color) os << ansi::bold;
-                if (sub_end != end)
+                if (sub_end != ctx_end)
                     os << ' ';
 
-                print_token_range(os, sub_end, tokens.end());
+                print_token_range(os, sub_end, ctx_end);
                 if (color) os << ansi::reset;
                 os << std::endl;
             }
@@ -97,11 +119,11 @@ namespace ppstep {
             }
 
             void format(std::ostream& os) const {
-                os << ansi::magenta_bg << ansi::white_fg;
+                os << ansi::bright_magenta_fg << ansi::underline << ansi::bold;
             }
 
             void explain(std::ostream& os) const {
-                os << "called macro " << ansi::magenta_bg << ansi::white_fg;
+                os << "called macro " << ansi::bright_magenta_fg << ansi::underline << ansi::bold;
                 print_token_container(os, tokens) << ansi::reset << std::endl;
             }
 
@@ -241,11 +263,11 @@ namespace ppstep {
                 : formatting_event<ContainerT, expanded<ContainerT>>(start, end), initial(std::move(initial)) {}
 
             void format(std::ostream& os) const {
-                os << ansi::yellow_bg << ansi::black_fg;
+                os << ansi::bright_yellow_fg << ansi::underline << ansi::bold;
             }
 
             void explain(std::ostream& os) const {
-                os << "expanded macro " << ansi::yellow_bg << ansi::black_fg;
+                os << "expanded macro " << ansi::bright_yellow_fg << ansi::underline << ansi::bold;
                 print_token_container(os, initial) << ansi::reset << std::endl;
             }
 
@@ -279,16 +301,16 @@ namespace ppstep {
 
         template <class ContainerT>
         struct rescanned : formatting_event<ContainerT, rescanned<ContainerT>> {
-            rescanned(ContainerT cause, ContainerT initial, std::size_t start, std::size_t end)
-                : formatting_event<ContainerT, rescanned<ContainerT>>(start, end), cause(std::move(cause)), initial(std::move(initial)) {}
+            rescanned(ContainerT cause, ContainerT initial, std::size_t start, std::size_t end, ContainerT result = {})
+                : formatting_event<ContainerT, rescanned<ContainerT>>(start, end), cause(std::move(cause)), initial(std::move(initial)), result(std::move(result)) {}
 
             void format(std::ostream& os) const {
-                os << ansi::bright_blue_bg << ansi::white_fg;
+                os << ansi::bright_cyan_fg << ansi::underline << ansi::bold;
             }
 
             void explain(std::ostream& os) const {
-                os << "rescanned macro " << ansi::yellow_bg << ansi::black_fg;
-                print_token_container(os, initial) << ansi::reset << "\ncaused by " << ansi::magenta_bg << ansi::white_fg;
+                os << "rescanned macro " << ansi::bright_yellow_fg << ansi::underline << ansi::bold;
+                print_token_container(os, initial) << ansi::reset << "\ncaused by " << ansi::bright_magenta_fg << ansi::underline << ansi::bold;
                 print_token_container(os, cause) << ansi::reset << std::endl;
             }
 
@@ -319,14 +341,18 @@ namespace ppstep {
                 os << "\n";
             }
 
-            ContainerT cause, initial;
+            ContainerT cause, initial, result;
         };
 
         template <class ContainerT>
         struct lexed {
             void print(std::ostream& os, ContainerT const& tokens) const {
+                // Only print the newly-lexed token (the last one), not the
+                // entire accumulated output — otherwise every `step` at a
+                // LEXED event re-dumps the whole file body so far.
+                if (tokens.empty()) return;
                 if (ppstep::color_enabled()) os << ansi::bold;
-                print_token_container(os, tokens);
+                print_token(os, tokens.back());
                 if (ppstep::color_enabled()) os << ansi::reset;
                 os << std::endl;
             }
@@ -493,10 +519,56 @@ namespace ppstep {
                 
                 push(std::move(new_tokens),
                      std::next(new_tokens.begin(), new_start),
-                     events::rescanned<ContainerT>(cause, initial, lexed_tokens.size() + new_start, lexed_tokens.size() + new_end));
+                     events::rescanned<ContainerT>(cause, initial, lexed_tokens.size() + new_start, lexed_tokens.size() + new_end, result));
 
             } catch (std::logic_error const&) {
-                push(ContainerT(result), events::rescanned<ContainerT>(cause, initial, lexed_tokens.size() + 0, lexed_tokens.size() + result.size()));
+                push(ContainerT(result), events::rescanned<ContainerT>(cause, initial, lexed_tokens.size() + 0, lexed_tokens.size() + result.size(), result));
+            }
+
+            // A `rescanned` that leaves BOTH the call stack and the rescan
+            // queue empty marks the completion of a whole top-level macro
+            // expansion tree — its result is final. Stash it BEFORE firing
+            // handle_prompt so the prompt (and the frames-log closer it
+            // renders via current_state → write_frames_log) sees `done:` /
+            // `(result)` at this stop, not `working:`. The server fires this
+            // hook BEFORE popping the rescanning frame (server.hpp:146 then
+            // :153), so at this instant the about-to-pop frame is still on the
+            // queue — a completion is `rescanning.size()==1` (only the current
+            // frame left) AND `expanding` already empty.
+            if (state->expanding.empty() && state->rescanning.size() == 1) {
+                last_completed_cause.clear();
+                last_completed_call.clear();
+                last_completed_result.clear();
+                // Render the full original call (name + args), e.g. `BOOL(123)`,
+                // not just the bare name — the closer/done line should show the
+                // source-level invocation that produced this result.
+                for (auto const& tk : cause) {
+                    if (!tk.is_valid()) continue;
+                    if (IS_CATEGORY(tk, boost::wave::WhiteSpaceTokenType)) continue;
+                    if (boost::wave::token_id(tk) == boost::wave::T_PLACEMARKER) continue;
+                    auto v = tk.get_value().c_str();
+                    if (!last_completed_call.empty()
+                        && last_completed_call.back() != '('
+                        && v[0] != ')' && v[0] != '(') {
+                        last_completed_call += ' ';
+                    }
+                    last_completed_call += v;
+                }
+                if (!cause.empty()) {
+                    last_completed_cause = cause.begin()->get_value().c_str();
+                }
+                for (auto const& tk : result) {
+                    if (tk.is_valid()
+                        && !IS_CATEGORY(tk, boost::wave::WhiteSpaceTokenType)
+                        && boost::wave::token_id(tk) != boost::wave::T_PLACEMARKER) {
+                        last_completed_result += tk.get_value().c_str();
+                        last_completed_result += ' ';
+                    }
+                }
+                if (!last_completed_result.empty()
+                    && last_completed_result.back() == ' ') {
+                    last_completed_result.pop_back();
+                }
             }
 
             // Use `cause` (the macro whose body was just rescanned) for the
@@ -507,6 +579,15 @@ namespace ppstep {
         
         template <typename ContextT, typename ExceptionT>
         void on_exception(ContextT& ctx, ExceptionT const& e) {
+            // Recoverable exceptions (missing #include resolved only from
+            // explicit -I, ill-formed #if from unknown builtins, etc.) are
+            // already warned-and-skipped inside server::throw_exception —
+            // prompting here would consume the `steps_requested`/`UNTIL_BREAK`
+            // state from an in-flight `continue`, so `continue` silently
+            // drops to FREE mode and never stops at the breakpoint.  Only
+            // prompt for truly fatal exceptions (the ones about to be
+            // re-thrown), where this is the last chance to inspect state.
+            if (e.is_recoverable()) return;
             cli.prompt(ctx, "exception");
         }
 
@@ -595,12 +676,21 @@ namespace ppstep {
             preprocessing_event_type type;
         };
 
-        // `finish` records the current expansion depth; the next `expanded`
-        // event at exactly that depth is the one that pops back to the caller.
+        // `finish` records the depth to RETURN TO once the current macro
+        // `finish`: run until the current top-level working macro — the one
+        // the frames-log closer labels `working:` — completes its ENTIRE
+        // expansion tree. That completion point is exactly the condition
+        // `on_rescanned` (line 541) already detects: both the call stack
+        // (`expanding`) and the rescan queue (`rescanning`) drained, i.e.
+        // `expanding.empty() && rescanning.size() == 1` at a RESCANNED event
+        // (the about-to-pop last frame still counted, since the server pops
+        // AFTER firing the hook — server.hpp:146 then :153). So `finish` just
+        // arms a flag and lets UNTIL_BREAK run every event until that RESCANNED
+        // fires; it stops there and the closer renders the `(result)` line.
+        // Issued when BOTH stacks are already empty (nothing in flight), bail.
         void arm_finish() {
-            if (state->expanding.empty()) return;
+            if (state->expanding.empty() && state->rescanning.empty()) return;
             finish_pending = true;
-            finish_target_depth = state->expanding.size();
         }
         void disarm_finish() { finish_pending = false; }
         bool is_finish_armed() const { return finish_pending; }
@@ -718,7 +808,22 @@ namespace ppstep {
         //   `rescanned X`   – just finished re-parsing the body
         //   `lexed X`       – just emitted token X
         std::string make_trigger(preprocessing_event_type type, TokenT const& token) const {
-            std::string name(token.get_value().c_str());
+            std::string raw(token.get_value().c_str());
+            // Newlines / tabs / other control chars in a token value (e.g.
+            // the newline token at the end of a `#define` body or source
+            // line) would corrupt the linenoise prompt line.  Render them
+            // as visible escapes so the trigger stays single-line.
+            std::string name;
+            name.reserve(raw.size());
+            for (char c : raw) {
+                switch (c) {
+                    case '\n': name += "\\n"; break;
+                    case '\r': name += "\\r"; break;
+                    case '\t': name += "\\t"; break;
+                    default: name += c; break;
+                }
+            }
+            if (name.empty()) name = "<eof>";
             switch (type) {
                 case preprocessing_event_type::CALL:
                     return "calling " + name;
@@ -800,8 +905,8 @@ namespace ppstep {
             // tidy on lines without an annotation.
             int idx = 0;
             for (auto it = state->expanding.rbegin(); it != state->expanding.rend(); ++it, ++idx) {
-                if (it->empty()) continue;
-                std::string name(it->begin()->get_value().c_str());
+                if (it->call.empty()) continue;
+                std::string name(it->call.begin()->get_value().c_str());
                 os << "  \xe2\x94\x82    #" << idx << "  " << name;
                 if (idx == 0) {
                     // The innermost (#0) is always the current call frame.
@@ -816,32 +921,54 @@ namespace ppstep {
             return os.str();
         }
 
-        // Right-pane content: rescan queue + call stack, returned as
-        // a vector of lines so the caller can render it side-by-side
-        // with the main event output.
-        std::vector<std::string> frames_pane_lines() const {
+        // Left-pane content (rescan queue + call stack) plus per-row
+        // metadata so the caller can (a) place each frame's `#define` in
+        // the right pane on the SAME row as the frame's `#N NAME` line,
+        // and (b) diff-highlight only genuinely-new frames.
+        struct frames_pane {
             std::vector<std::string> lines;
+            // For each call-stack frame row: its index into `lines`, and
+            // the macro name on that row. Parallel vectors; rendered
+            // innermost-first (matches the `#0` ordering).
+            std::vector<std::size_t> frame_rows;
+            std::vector<std::string> frame_names;
+            // Same idea for rescan-queue frames: which left row each
+            // `#N NAME` sits on, and its macro name, so the right pane
+            // can render its `#define` on the same row.
+            std::vector<std::size_t> rescan_frame_rows;
+            std::vector<std::string> rescan_frame_names;
+        };
+
+        frames_pane frames_pane_lines() const {
+            frames_pane fp;
+            auto& lines = fp.lines;
 
             // ─── rescan queue ───
+            // Render ALL live rescan frames innermost-first (#0 = the body
+            // currently being rescanned). The earlier `size() - 1` hid the
+            // innermost frame, so the queue read as "empty" whenever a rescan
+            // was in progress — the exact moment the queue is most relevant.
+            // `rescanned_macro` pops the frame before the prompt fires, so a
+            // just-finished rescan is already gone (no double-count).
             lines.push_back("-- rescan queue --");
-            std::size_t qdepth_pre = state->rescanning.size();
-            std::size_t qdepth = qdepth_pre == 0 ? 0 : qdepth_pre - 1;
+            std::size_t qdepth = state->rescanning.size();
             if (qdepth == 0) {
                 lines.push_back("  empty (lex/punct next)");
             } else {
-                lines.push_back(std::string("  ") + std::to_string(qdepth)
-                    + " frame" + (qdepth == 1 ? "" : "s") + " (next first):");
                 int qidx = 0;
-                auto it = state->rescanning.rbegin();
-                ++it;
-                for (; qidx < (int)qdepth; ++qidx, ++it) {
+                for (auto it = state->rescanning.rbegin(); it != state->rescanning.rend(); ++it, ++qidx) {
                     auto const& cause = it->first;
                     std::string qname = cause.empty() ? "(unknown)"
                                                       : std::string(cause.begin()->get_value().c_str());
                     std::string line = "    #" + std::to_string(qidx) + " " + qname;
                     // ASCII marker "<-" instead of ◀ so byte-pad in
                     // write_frames_log stays aligned with char columns.
-                    if (qidx == 0) line += "  <- next";
+                    // #0 is the body being rescanned RIGHT NOW; deeper entries
+                    // are pending (will be rescanned after this one completes).
+                    if (qidx == 0) line += "  <- now";
+                    else if (qidx == 1) line += "  <- next";
+                    fp.rescan_frame_rows.push_back(lines.size());
+                    fp.rescan_frame_names.push_back(qname);
                     lines.push_back(line);
                 }
             }
@@ -854,19 +981,53 @@ namespace ppstep {
             if (edepth == 0) {
                 lines.push_back("  (empty)");
             } else {
-                lines.push_back(std::string("  ") + std::to_string(edepth)
-                    + " frame" + (edepth == 1 ? "" : "s") + " (innermost first):");
                 int eidx = 0;
                 for (auto it = state->expanding.rbegin(); it != state->expanding.rend(); ++it, ++eidx) {
-                    if (it->empty()) continue;
-                    std::string ename(it->begin()->get_value().c_str());
+                    if (it->call.empty()) continue;
+                    std::string ename(it->call.begin()->get_value().c_str());
                     std::string line = "    #" + std::to_string(eidx) + " " + ename;
                     // ASCII marker "<-" instead of ◀ for column alignment.
                     if (eidx == 0) line += "  <- current";
+                    fp.frame_rows.push_back(lines.size());
+                    fp.frame_names.push_back(ename);
                     lines.push_back(line);
                 }
             }
-            return lines;
+
+            lines.push_back("");
+
+            // ─── disabled (blue) ───
+            // A macro is "painted blue" (disabled) for exactly the lifetime of
+            // its `rescanning` frame — `expanded_macro` pushes the frame, the
+            // macro's name is the frame's `cause` (`.first`), and
+            // `rescanned_macro` pops it. So the disabled set IS the union of
+            // `cause` names across all live `rescanning` frames. No separate
+            // server state needed; derived from the same LIFO that mirrors
+            // Wave's rescan stack, so it can't desync.
+            lines.push_back("-- disabled (blue) --");
+            if (state->rescanning.empty()) {
+                lines.push_back("  (none)");
+            } else {
+                // Union of cause names, innermost-first, dedup preserving
+                // first-seen order (a macro expanding twice nested shows once,
+                // at the deeper scope).
+                std::vector<std::string> names;
+                for (auto it = state->rescanning.rbegin(); it != state->rescanning.rend(); ++it) {
+                    auto const& cause = it->first;
+                    if (cause.empty()) continue;
+                    std::string n(cause.begin()->get_value().c_str());
+                    if (std::find(names.begin(), names.end(), n) == names.end()) {
+                        names.push_back(n);
+                    }
+                }
+                std::string joined;
+                for (std::size_t i = 0; i < names.size(); ++i) {
+                    if (i) joined += ", ";
+                    joined += names[i];
+                }
+                lines.push_back("  " + joined);
+            }
+            return fp;
         }
 
         // Path of the frames log file. Fixed at /tmp/ppstep_frames.log so
@@ -899,16 +1060,20 @@ namespace ppstep {
             localtime_r(&t, &tm_buf);
             std::strftime(ts, sizeof(ts), "%H:%M:%S", &tm_buf);
 
-            // -- LEFT pane: rescan queue + call stack counts/lists ---------
-            std::vector<std::string> left_lines = frames_pane_lines();
+            // -- LEFT pane + per-row frame metadata -----------------------
+            frames_pane fp = frames_pane_lines();
+            auto const& left_lines = fp.lines;
 
-            // -- RIGHT pane: #define for two key macros ------------------
-            std::vector<std::string> right_lines;
-            auto append_macro_def = [&](std::string const& header, std::string const& name) {
-                // Header includes the macro name so the user knows WHICH
-                // #define they're looking at without cross-referencing the
-                // left pane.
-                right_lines.push_back("-- " + header + ": " + name + " --");
+            // -- RIGHT pane: #define on the SAME row as the frame ---------
+            // One line per left row; non-frame rows are blank so each
+            // frame's `#define NAME ...` sits beside its `#N NAME` row in
+            // the left pane, not in a separate top-aligned block.
+            std::vector<std::string> right_lines(left_lines.size(), std::string());
+            // Render a macro's full `#define NAME(params) body` to a string.
+            // `max_def` truncates (with "...") when set; pass 0 for no limit
+            // (used by the closer, which wants the whole definition).
+            auto render_define_str = [&](std::string const& name, std::size_t max_def) -> std::string {
+                if (name.empty()) return std::string();
                 bool has_params = false, is_predefined = false;
                 typename ContextT::position_type pos;
                 std::vector<typename ContextT::token_type> parameters;
@@ -916,71 +1081,69 @@ namespace ppstep {
                 try {
                     ctx.get_macro_definition(name, has_params, is_predefined, pos, parameters, definition);
                 } catch (...) {
-                    right_lines.push_back("  (lookup failed)");
-                    return;
+                    return "#define " + name + "  (lookup failed)";
                 }
-                std::ostringstream bl;
-                bl << "  body: ";
-                for (auto const& t : definition) bl << t.get_value().c_str();
-                std::string body = bl.str();
-                constexpr std::size_t max_body = 60;
-                if (body.size() > max_body) body = body.substr(0, max_body - 3) + "...";
-                right_lines.push_back(body);
+                std::ostringstream dl;
+                dl << "#define " << name;
                 if (has_params) {
-                    std::ostringstream pl;
-                    pl << "  params: ";
+                    dl << "(";
                     for (std::size_t i = 0; i < parameters.size(); ++i) {
-                        if (i) pl << ", ";
-                        pl << parameters[i].get_value().c_str();
+                        if (i) dl << ", ";
+                        dl << parameters[i].get_value().c_str();
                     }
-                    right_lines.push_back(pl.str());
+                    dl << ")";
                 }
+                dl << " ";
+                for (auto const& tk : definition) dl << tk.get_value().c_str();
+                std::string def = dl.str();
+                if (max_def && def.size() > max_def) def = def.substr(0, max_def - 3) + "...";
+                return def;
             };
-
-            // The left pane already marks the next-to-rescan frame with
-            // `<- next`. So the right pane pairs with "now": just the
-            // currently-active expansion (innermost call frame).
-            if (!state->expanding.empty()) {
-                auto const& top = state->expanding.back();
-                if (!top.empty()) {
-                    std::string name(top.begin()->get_value().c_str());
-                    if (!name.empty()) {
-                        append_macro_def("current call", name);
-                    }
-                }
+            auto render_define = [&](std::size_t row, std::string const& name) {
+                right_lines[row] = render_define_str(name, 48);
+            };
+            for (std::size_t i = 0; i < fp.frame_rows.size(); ++i) {
+                render_define(fp.frame_rows[i], fp.frame_names[i]);
+            }
+            for (std::size_t i = 0; i < fp.rescan_frame_rows.size(); ++i) {
+                render_define(fp.rescan_frame_rows[i], fp.rescan_frame_names[i]);
             }
 
-            // -- Diff against previous frame snapshot ---------------------
-            // Set-based: classify each current line as new (in curr but not
-            // prev) or unchanged. Then append removed lines (in prev but not
-            // curr) so the user sees the frame that just popped. Set-based
-            // avoids false positives from section growth shifting later
-            // lines' positions.
-            struct diff_entry { std::string text; int kind; };
-            std::vector<diff_entry> left_diff;
-            std::set<std::string> prev_set(prev_frames_lines.begin(),
-                                           prev_frames_lines.end());
-            std::set<std::string> curr_set(left_lines.begin(),
-                                           left_lines.end());
-            for (auto const& line : left_lines) {
-                int kind = prev_set.count(line) ? 0 : +1;  // +1 = added
-                left_diff.push_back({line, kind});
+            // -- Frame-aware diff: highlight only genuinely-new frames ----
+            // Frames are rendered innermost-first (#0 = innermost). Compare
+            // the outermost-first name sequences of the current and previous
+            // stacks: a frame present in both (by name, from the outer end)
+            // is unchanged even if its `#N` index shifted when a new frame
+            // was pushed on top. Only the suffix of new names (the innermost
+            // frames that have no counterpart in the previous stack) is
+            // highlighted. No "removed" lines are appended — the current
+            // state is rendered alone, so the old and new stacks never
+            // appear together in one block.
+            std::vector<std::string> cur_outer;
+            for (auto it = state->expanding.begin(); it != state->expanding.end(); ++it) {
+                if (it->call.empty()) continue;
+                cur_outer.push_back(std::string(it->call.begin()->get_value().c_str()));
             }
-            for (auto const& line : prev_frames_lines) {
-                if (!curr_set.count(line)) {
-                    left_diff.push_back({line, -1});      // -1 = removed
-                }
+            std::size_t common = 0;
+            for (std::size_t i = 0;
+                 i < std::min(cur_outer.size(), prev_frame_names.size()); ++i) {
+                if (cur_outer[i] == prev_frame_names[i]) ++common;
+                else break;
             }
-            prev_frames_lines = left_lines;  // snapshot for next diff
+            std::size_t new_count = cur_outer.size() > common
+                                        ? cur_outer.size() - common : 0;
+            std::vector<char> is_new_frame(left_lines.size(), 0);
+            for (std::size_t i = 0; i < new_count && i < fp.frame_rows.size(); ++i) {
+                is_new_frame[fp.frame_rows[i]] = 1;
+            }
+            prev_frame_names = cur_outer;   // snapshot for next diff
 
             // -- Render two-pane layout, line by line ----------------------
             constexpr int SPLIT = 50;
             bool color = color_enabled();
-            std::size_t n = std::max(left_diff.size(), right_lines.size());
             frames_log_file << "── [stop " << ts << "] ──\n";
-            for (std::size_t i = 0; i < n; ++i) {
-                std::string l = i < left_diff.size() ? left_diff[i].text : std::string();
-                int kind = i < left_diff.size() ? left_diff[i].kind : 0;
+            for (std::size_t i = 0; i < left_lines.size(); ++i) {
+                std::string l = left_lines[i];
                 std::string r = i < right_lines.size() ? right_lines[i] : std::string();
                 if (l.size() > (std::size_t)SPLIT) l = l.substr(0, SPLIT - 3) + "...";
                 else if (l.size() < (std::size_t)SPLIT) l.append(SPLIT - l.size(), ' ');
@@ -988,14 +1151,111 @@ namespace ppstep {
                 // Color wrap goes AROUND the padded cell so byte-padding
                 // still puts `|` at column 50. ANSI bytes don't take columns
                 // in a terminal — only the cell content does.
-                if (kind != 0 && color) {
-                    if (kind > 0) frames_log_file << "\e[32m";   // green = added
-                    else         frames_log_file << "\e[31m";   // red   = removed
-                    frames_log_file << l << "\e[0m";
+                if (is_new_frame[i] && color) {
+                    frames_log_file << "\e[32m" << l << "\e[0m";  // green = new frame
                 } else {
                     frames_log_file << l;
                 }
                 frames_log_file << " | " << r << "\n";
+            }
+
+            // -- Contextual closer: top-level working macro + final result ----
+            // The closing separator carries the OUTERMOST live macro — the
+            // top of the current expansion tree — so every stop's closer
+            // names what the whole rescan/call activity is ultimately in
+            // service of. The outermost frame is the first-pushed one:
+            //   expanding.front()  if a substitution is in flight, else
+            //   rescanning.front() if only rescans remain, else
+            //   (both empty)        → a macro just completed: name its cause.
+            // When a `rescanned` emptied both stacks, append the final
+            // result too, so `tail -f` sees what each source-level call
+            // produced at the moment it lands. The closer pads to SPLIT so
+            // its `|` lines up with the two-pane rows above it; the result
+            // (if any) spills into the right pane slot.
+            // When a macro just completed (last_completed_result set), name
+            // THAT macro — even if a parent expansion is still in flight —
+            // because the result line is the headline of this stop. Otherwise
+            // name the OUTERMOST live frame across both stacks: the top-level
+            // macro whose source-level call started the whole expansion tree.
+            // Once a macro fires `expanded` it moves to the rescan queue, and
+            // all nested calls/expansions happen DURING that rescan — so the
+            // oldest rescan frame (rescanning.front(), the first-pushed) is
+            // the top-level macro whenever rescanning is non-empty; only when
+            // the rescan queue is empty does an expanding frame own the top.
+            // Render a token container (a macro call, name + args) to a
+            // compact string, e.g. `BOOL(123)` — joining non-whitespace
+            // tokens with a single space (but no space after `(`).
+            auto render_call = [](auto const& cont) -> std::string {
+                std::string s;
+                for (auto const& tk : cont) {
+                    if (!tk.is_valid()) continue;
+                    if (IS_CATEGORY(tk, boost::wave::WhiteSpaceTokenType)) continue;
+                    if (boost::wave::token_id(tk) == boost::wave::T_PLACEMARKER) continue;
+                    auto v = tk.get_value().c_str();
+                    if (!s.empty() && s.back() != '(' && v[0] != ')' && v[0] != '(') s += ' ';
+                    s += v;
+                }
+                return s;
+            };
+            std::string top_macro;   // bare name, for the `#define` lookup
+            std::string top_call;     // full call with args, e.g. `BOOL(123)`
+            if (!last_completed_result.empty()) {
+                top_macro = last_completed_cause;
+                top_call = last_completed_call.empty() ? last_completed_cause
+                                                        : last_completed_call;
+            } else if (!state->rescanning.empty()) {
+                auto const& f = state->rescanning.front();
+                if (!f.first.empty()) {
+                    top_macro = f.first.begin()->get_value().c_str();
+                    top_call = render_call(f.first);
+                }
+            } else if (!state->expanding.empty()) {
+                auto const& f = state->expanding.front();
+                if (!f.call.empty()) {
+                    top_macro = f.call.begin()->get_value().c_str();
+                    top_call = render_call(f.call);
+                }
+            }
+            // Left half of the closer: "── working: <call>" or, on
+            // completion, "── done: <call>" — the full original source-level
+            // invocation (name + args), not just the bare name. Right half:
+            // the macro's FULL `#define` (no truncation). Highlighted (bright
+            // magenta = working, bright yellow = done) so it stands out from
+            // the per-frame rows above as the headline of the stop.
+            std::string closer_left;
+            bool completed = !last_completed_result.empty();
+            if (completed) {
+                closer_left = "── done: " + (top_call.empty() ? top_macro : top_call);
+            } else {
+                closer_left = "── working: ";
+                if (top_call.empty()) closer_left += "(none)";
+                else                  closer_left += top_call;
+            }
+            std::string closer_right = render_define_str(top_macro, 0);
+            if ((int)closer_left.size() > SPLIT) closer_left = closer_left.substr(0, SPLIT - 3) + "...";
+            else if ((int)closer_left.size() < SPLIT) closer_left.append(SPLIT - closer_left.size(), ' ');
+            if (color) {
+                frames_log_file << (completed ? ansi::bright_yellow_fg
+                                               : ansi::bright_magenta_fg)
+                                << ansi::bold;
+            }
+            frames_log_file << closer_left << " | " << closer_right;
+            if (color) frames_log_file << ansi::reset;
+            frames_log_file << "\n";
+
+            // On completion, a dedicated RESULT banner sits below the closer
+            // line so the final value is the visual headline of the stop —
+            // not buried at the end of the `done:` line. Bright green +
+            // bold + a `>> result >>` marker set it apart from every other
+            // row in the log. Padded to SPLIT so its `|` lines up too.
+            if (completed) {
+                if (color) frames_log_file << "\e[92m\e[1m";  // bright green + bold
+                frames_log_file << "  (result) " << last_completed_result;
+                if (color) frames_log_file << ansi::reset;
+                frames_log_file << "\n";
+                last_completed_result.clear();  // one-shot
+                last_completed_cause.clear();
+                last_completed_call.clear();
             }
             frames_log_file << "──────────────────\n";
             frames_log_file.flush();
@@ -1072,19 +1332,26 @@ namespace ppstep {
                             break;
                         }
                         case preprocessing_event_type::EXPANDED: {
-                            // `finish`: stop on the next expansion that pops back
-                            // to the depth we recorded (skipping nested calls of
-                            // the same macro name).
-                            if (finish_pending && state->expanding.size() == finish_target_depth) {
-                                do_prompt = true;
-                            } else if (expanded_breakpoints.find(token.get_value()) != expanded_breakpoints.end()) {
+                            if (expanded_breakpoints.find(token.get_value()) != expanded_breakpoints.end()) {
                                 do_prompt = true;
                             }
                             break;
                         }
                         case preprocessing_event_type::RESCANNED: {
-                            if (rescanned_breakpoints.find(token.get_value()) != rescanned_breakpoints.end())
+                            // `finish`: stop at the RESCANNED that drains both
+                            // stacks — the completion of the whole top-level
+                            // working macro tree (same condition `on_rescanned`
+                            // at line 541 uses to stash the final result). The
+                            // server pops the rescan frame AFTER firing the hook
+                            // (server.hpp:146 then :153), so the about-to-pop
+                            // frame is still counted: completion is exactly
+                            // `expanding.empty() && rescanning.size() == 1`.
+                            if (finish_pending && state->expanding.empty()
+                                && state->rescanning.size() == 1) {
                                 do_prompt = true;
+                            } else if (rescanned_breakpoints.find(token.get_value()) != rescanned_breakpoints.end()) {
+                                do_prompt = true;
+                            }
                             break;
                         }
                         case preprocessing_event_type::LEXED: {
@@ -1096,11 +1363,20 @@ namespace ppstep {
                     }
                     break;
                 }
+                case stepping_mode::UNTIL_MACRO: {
+                    // `next`: skip LEXED events, stop at the next macro
+                    // event (call/expand/rescan). The `steps_requested`
+                    // decrement in `prompt()` still fires — it counts macro
+                    // events only because LEXED never reaches `do_prompt`.
+                    if (type != preprocessing_event_type::LEXED)
+                        do_prompt = true;
+                    break;
+                }
             }
 
             if (do_prompt) {
-                if (type == preprocessing_event_type::EXPANDED && finish_pending
-                    && state->expanding.size() == finish_target_depth) {
+                if (type == preprocessing_event_type::RESCANNED && finish_pending
+                    && state->expanding.empty() && state->rescanning.size() == 1) {
                     finish_pending = false;
                 }
                 cli.prompt(ctx, make_trigger(type, token));
@@ -1115,13 +1391,21 @@ namespace ppstep {
         std::set<typename TokenT::string_type> rescanned_breakpoints;
         std::set<typename TokenT::string_type> lexed_breakpoints;
         bool finish_pending = false;
-        std::size_t finish_target_depth = 0;
         std::string frames_log_path;  // empty → use default_frames_log_path()
         mutable std::ofstream frames_log_file;
         mutable bool frames_log_open = false;
-        // Last left-pane snapshot, for diff-highlighting changed lines on the
-        // next write. Stays in sync with the most-recently-written block.
-        mutable std::vector<std::string> prev_frames_lines;
+        // Last call-stack frame-name snapshot (outermost-first), for
+        // frame-aware diff-highlighting of genuinely-new frames on the next
+        // write. Stays in sync with the most-recently-written block.
+        mutable std::vector<std::string> prev_frame_names;
+        // The result of the most-recently-completed top-level macro
+        // expansion (set in on_rescanned when both stacks empty, read once
+        // then cleared by write_frames_log). Empty when the last event did
+        // NOT complete a top-level macro — so the `=> ... => ...` line only
+        // appears at the stop where a whole macro expansion tree finished.
+        mutable std::string last_completed_cause;
+        mutable std::string last_completed_call;
+        mutable std::string last_completed_result;
         std::vector<numbered_bp> numbered_breakpoints;
         int next_bp_id = 1;
         stepping_mode mode;
