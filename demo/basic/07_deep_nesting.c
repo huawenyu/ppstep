@@ -16,7 +16,7 @@
 //       s             (step to next macro event)
 //       <Enter>       (repeat s — watch the call stack + rescan queue)
 //
-// The frames log (/tmp/ppstep_frames.log) shows both:
+// The frames log (/tmp/ppstep.log) shows both:
 //   - call stack (expanding): which macro is being substituted RIGHT NOW
 //   - rescan queue (rescanning): bodies waiting to be re-scanned
 //

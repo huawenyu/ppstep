@@ -16,7 +16,7 @@
 //   #x  → raw form "X" → stringize → "X"
 //    x  → expanded form (X → hello) → hello
 //
-// Run:  ppstep demo/basic/04_stringify.c
+// Run:  ppstep demo/basic/04_2_stringify.c
 // Try:  b c STR    (break on call STR)
 //       c          (continue to the STR call)
 //       s s s s    (step — note the nested `calling X` between
@@ -48,6 +48,7 @@
 // `#undef X` first: redefining a macro to a DIFFERENT body is illegal
 // (C §6.10.3p2), and Wave keeps the old definition with a warning,
 // which would make this case produce "hello" instead of "123".
+#define STR(x)  #x
 #define XSTR(x) STR(x)
 #undef X
 #define X 123

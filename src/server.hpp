@@ -215,8 +215,7 @@ namespace ppstep {
             // step through the macros that ARE defined. Only truly
             // fatal (non-recoverable) errors propagate to main().
             if (e.is_recoverable()) {
-                std::cerr << "warning: " << e.what() << ": "
-                          << e.description() << std::endl;
+                print_diagnostic(std::cout, e) << std::endl;
                 return;
             }
             boost::throw_exception(e);

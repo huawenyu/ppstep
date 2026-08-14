@@ -436,7 +436,8 @@ lives under `demo/basic/`; `demo/cpp_magic/` holds extended examples:
 | `basic/01_ordinary.c` | ordinary token | Non-macro tokens copied verbatim — no call/expand/rescan |
 | `basic/02_selfref.c` | object macro | Self-reference: `#define foo foo+1` — `foo` painted blue during its own rescan |
 | `basic/03_funcargs.c` | function macro | Normal arg expansion: `ID(M)` → arg `M` expanded to `42` before substitution |
-| `basic/04_stringify.c` | function macro + `#` | `#` selects the raw form at its use-site: `STR(X)` body `#x + x` → `"X" + hello` (one arg, two forms); contrast `XSTR(X)`→`"123"` (ordinary use splices the expanded form) |
+| `basic/04_1_stringify.c` | function macro + `#` | `#` selects the raw form at its use-site: `STR(X)` body `#x + x` → `"X" + hello` (one arg, two forms) |
+| `basic/04_2_stringify.c` | function macro + `#` | stringify the *value*: `XSTR(X)`→`"123"` — ordinary param expands first, then `#` stringizes the expanded form |
 | `basic/05_paste.c` | function macro + `##` | `##` selects the raw form: `CAT(NAME,_suffix)` → `NAME_suffix` (not `var_suffix`) |
 | `basic/06_nested_rescan.c` | function macro rescan | Rescan finds a macro in the substituted *body* (`TAIL`), not the argument: `A(42)` → `42 + 99` |
 | `basic/07_deep_nesting.c` | full pipeline | 3-level nesting: `C → B(42) → A(42+1) → [42+1]` — call stack + rescan queue |
@@ -453,8 +454,8 @@ Run any of them with, e.g.:
 ppstep demo/basic/03_funcargs.c
 ```
 
-The frames log at `/tmp/ppstep_frames.log` mirrors the live call stack,
-rescan queue, and disabled (blue) set — `tail -f` it in another terminal
+The frames log at `/tmp/ppstep.log` mirrors the live call stack,
+rescan queue, and disabled (blue) set — `tail -F` it in another terminal
 while stepping.
 
 ## Building

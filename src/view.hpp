@@ -810,7 +810,7 @@ namespace ppstep {
             }, latest->event);
 
             // Always mirror the current frames state to the log file so
-            // the user can `tail -f` it in another terminal.
+            // the user can `tail -F` it in another terminal.
             cl.write_frames_log(ctx);
         }
 
@@ -848,11 +848,25 @@ namespace ppstep {
             auto filename = boost::filesystem::path(file).filename().string();
             int num_width = std::to_string(end).size();
 
+            // Highlight the current line — the top-level macro's call site.
+            // `get_main_pos()` follows the OUTERMOST expansion: it stays
+            // pinned to the source-level call that started the current
+            // expansion tree across every nested call/expand/rescan within
+            // it, so this highlights the top working macro's line, not the
+            // innermost current-expanding macro's definition. Bright
+            // magenta + bold + underline matches the `call` event highlight
+            // (ansi::bright_magenta_fg) so the highlighted line reads as
+            // "this is the macro call in flight".
+            bool color = ppstep::color_enabled();
             for (int i = start; i < end; ++i) {
-                char marker = (i == current - 1) ? '>' : ' ';
+                bool is_current = (i == current - 1);
+                char marker = is_current ? '>' : ' ';
+                if (color && is_current) os << ansi::white_bg << ansi::black_fg << ansi::bold;
                 os << "  " << marker << " "
                    << std::setw(num_width) << (i + 1) << " | "
-                   << lines[i] << '\n';
+                   << lines[i];
+                if (color && is_current) os << ansi::reset;
+                os << '\n';
             }
         }
 

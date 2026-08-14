@@ -22,25 +22,6 @@
 #include "utils.hpp"
 
 namespace ppstep {
-    namespace ansi {
-        // Foreground-only highlight palette. The highlight window marks a
-        // token span (the current macro call / expansion / rescan) with a
-        // bright foreground color + underline instead of a background fill.
-        // Background-inverted cells fight the terminal theme: on a dark
-        // theme the standard yellow bg ("\u001b[43m") renders as dark olive
-        // and black text on it is low contrast.  Bright fg colors on the
-        // terminal's own background stay vivid and readable on both light
-        // and dark themes; underline marks the span boundary without
-        // inverting the cell.
-        constexpr auto bright_magenta_fg = "\u001b[95m";  // call
-        constexpr auto bright_yellow_fg  = "\u001b[93m";  // expanded
-        constexpr auto bright_cyan_fg    = "\u001b[96m";  // rescanned
-
-        constexpr auto underline = "\u001b[4m";
-        constexpr auto bold      = "\u001b[1m";
-
-        constexpr auto reset = "\u001b[0m";
-    }
 
     namespace events {
         template <class ContainerT, class DerivedT>
@@ -80,7 +61,10 @@ namespace ppstep {
 
                 if (color) static_cast<DerivedT const*>(this)->format(os);
                 if (sub_start != sub_end) {
-                    print_token_range(os, sub_start, sub_end);
+                    // Plain print (no per-token fg) so the event's highlight
+                    // color set by format() stays on the macro-name span —
+                    // per-token fg would override it and erase the highlight.
+                    print_token_range_plain(os, sub_start, sub_end);
                     if (color) os << ansi::reset;
                 } else {
                     os << ' ';
@@ -119,11 +103,11 @@ namespace ppstep {
             }
 
             void format(std::ostream& os) const {
-                os << ansi::bright_magenta_fg << ansi::underline << ansi::bold;
+                os << ansi::white_bg << ansi::black_fg << ansi::bold;
             }
 
             void explain(std::ostream& os) const {
-                os << "called macro " << ansi::bright_magenta_fg << ansi::underline << ansi::bold;
+                os << "called macro " << ansi::white_fg << ansi::bold;
                 print_token_container(os, tokens) << ansi::reset << std::endl;
             }
 
@@ -263,11 +247,11 @@ namespace ppstep {
                 : formatting_event<ContainerT, expanded<ContainerT>>(start, end), initial(std::move(initial)) {}
 
             void format(std::ostream& os) const {
-                os << ansi::bright_yellow_fg << ansi::underline << ansi::bold;
+                os << ansi::yellow_bg << ansi::black_fg << ansi::bold;
             }
 
             void explain(std::ostream& os) const {
-                os << "expanded macro " << ansi::bright_yellow_fg << ansi::underline << ansi::bold;
+                os << "expanded macro " << ansi::yellow_fg << ansi::bold;
                 print_token_container(os, initial) << ansi::reset << std::endl;
             }
 
@@ -305,12 +289,12 @@ namespace ppstep {
                 : formatting_event<ContainerT, rescanned<ContainerT>>(start, end), cause(std::move(cause)), initial(std::move(initial)), result(std::move(result)) {}
 
             void format(std::ostream& os) const {
-                os << ansi::bright_cyan_fg << ansi::underline << ansi::bold;
+                os << ansi::cyan_bg << ansi::black_fg << ansi::bold;
             }
 
             void explain(std::ostream& os) const {
-                os << "rescanned macro " << ansi::bright_yellow_fg << ansi::underline << ansi::bold;
-                print_token_container(os, initial) << ansi::reset << "\ncaused by " << ansi::bright_magenta_fg << ansi::underline << ansi::bold;
+                os << "rescanned macro " << ansi::cyan_fg << ansi::bold;
+                print_token_container(os, initial) << ansi::reset << "\ncaused by " << ansi::white_fg << ansi::bold;
                 print_token_container(os, cause) << ansi::reset << std::endl;
             }
 
@@ -588,6 +572,11 @@ namespace ppstep {
             // prompt for truly fatal exceptions (the ones about to be
             // re-thrown), where this is the last chance to inspect state.
             if (e.is_recoverable()) return;
+            // Non-recoverable: this is the last chance to show the diagnostic
+            // before the re-throw propagates to main()'s catch (which only
+            // fires after the prompt loop exits). Print it now so the user
+            // sees the error at the (exception) prompt, not only on exit.
+            print_diagnostic(std::cout, e) << std::endl;
             cli.prompt(ctx, "exception");
         }
 
@@ -1030,19 +1019,19 @@ namespace ppstep {
             return fp;
         }
 
-        // Path of the frames log file. Fixed at /tmp/ppstep_frames.log so
-        // the user has a stable known location to `tail -f` from another
+        // Path of the frames log file. Fixed at /tmp/ppstep.log so
+        // the user has a stable known location to `tail -F` from another
         // terminal. Appended-to on every event stop (file only grows),
-        // so `tail -f` works without "file truncated" warnings.
+        // so `tail -F` works without "file truncated" warnings.
         static std::string default_frames_log_path() {
-            return "/tmp/ppstep_frames.log";
+            return "/tmp/ppstep.log";
         }
 
         // Append a two-pane snapshot of the current preprocessing state to
         // the log file. Left pane: rescan queue + call stack. Right pane:
         // `#define` of the next macro wave will rescan, plus `#define` of
         // the macro wave is currently expanding. Appended to (never
-        // truncated) so `tail -f` runs cleanly without "file truncated"
+        // truncated) so `tail -F` runs cleanly without "file truncated"
         // warnings or content overlap.
         template <class ContextT>
         void write_frames_log(ContextT& ctx) const {
@@ -1145,8 +1134,12 @@ namespace ppstep {
             for (std::size_t i = 0; i < left_lines.size(); ++i) {
                 std::string l = left_lines[i];
                 std::string r = i < right_lines.size() ? right_lines[i] : std::string();
-                if (l.size() > (std::size_t)SPLIT) l = l.substr(0, SPLIT - 3) + "...";
-                else if (l.size() < (std::size_t)SPLIT) l.append(SPLIT - l.size(), ' ');
+                // Pad by display columns (display_width), not bytes — the
+                // rows use box-drawing chars (── │) that are multi-byte but
+                // single-column; byte-padding would push `|` off SPLIT.
+                std::size_t w = display_width(l);
+                if (w > (std::size_t)SPLIT) l = l.substr(0, SPLIT - 3) + "...";
+                else if (w < (std::size_t)SPLIT) l.append(SPLIT - w, ' ');
 
                 // Color wrap goes AROUND the padded cell so byte-padding
                 // still puts `|` at column 50. ANSI bytes don't take columns
@@ -1168,7 +1161,7 @@ namespace ppstep {
             //   rescanning.front() if only rescans remain, else
             //   (both empty)        → a macro just completed: name its cause.
             // When a `rescanned` emptied both stacks, append the final
-            // result too, so `tail -f` sees what each source-level call
+            // result too, so `tail -F` sees what each source-level call
             // produced at the moment it lands. The closer pads to SPLIT so
             // its `|` lines up with the two-pane rows above it; the result
             // (if any) spills into the right pane slot.
@@ -1232,12 +1225,16 @@ namespace ppstep {
                 else                  closer_left += top_call;
             }
             std::string closer_right = render_define_str(top_macro, 0);
-            if ((int)closer_left.size() > SPLIT) closer_left = closer_left.substr(0, SPLIT - 3) + "...";
-            else if ((int)closer_left.size() < SPLIT) closer_left.append(SPLIT - closer_left.size(), ' ');
+            // Pad by display columns (box chars ── are multi-byte, 1 column).
+            int cw = static_cast<int>(display_width(closer_left));
+            if (cw > SPLIT) closer_left = closer_left.substr(0, SPLIT - 3) + "...";
+            else if (cw < SPLIT) closer_left.append(SPLIT - cw, ' ');
             if (color) {
-                frames_log_file << (completed ? ansi::bright_yellow_fg
-                                               : ansi::bright_magenta_fg)
-                                << ansi::bold;
+                // done = red+bold (completion headline); working = red+bold
+                // too — both stand out at a glance. The `(result)` banner
+                // below keeps its own bright-green color to distinguish the
+                // final value from the `done:` label.
+                frames_log_file << ansi::red_fg << ansi::bold;
             }
             frames_log_file << closer_left << " | " << closer_right;
             if (color) frames_log_file << ansi::reset;

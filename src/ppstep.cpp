@@ -136,7 +136,8 @@ int main(int argc, char const** argv) {
 
     std::cerr << "frames log: " << ppstep::client<token_type,
                                                  token_sequence_type>::default_frames_log_path()
-              << "  (tail -f in another terminal to watch rescan queue / call stack)\n";
+              << "  (tail -F in another terminal to watch rescan queue / call stack)\n"
+              << "  command 'help' for help; 'step' to jump to the first macro.\n";
 
     auto first = ctx.begin();
     auto last = ctx.end();
@@ -150,9 +151,9 @@ int main(int argc, char const** argv) {
     } catch (ppstep::session_terminate const& e) {
         ;
     } catch (boost::wave::cpp_exception const& e) {
-        std::cerr << e.what() << ": " << e.description() << std::endl;
+        ppstep::print_diagnostic(std::cout, e) << std::endl;
     } catch (boost::wave::cpplexer::lexing_exception const& e) {
-        std::cerr << e.what() << ": " << e.description() << std::endl;
+        ppstep::print_diagnostic(std::cout, e) << std::endl;
     }
 
     return 0;
