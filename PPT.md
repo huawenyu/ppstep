@@ -3,6 +3,7 @@ title: "The C and C++ preprocessors"
 authors:
   - Huawen Yu
   - presenterm -x [^1]
+  - https://github.com/huawenyu/ppstep
   - 2026-08-12
 options:
   command_prefix: "cmd:"
